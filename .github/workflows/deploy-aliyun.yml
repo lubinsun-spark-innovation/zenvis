@@ -16,6 +16,7 @@ on:
         default: diagnose
         options:
           - diagnose
+          - stop
           - deploy
       backend_ref:
         description: zenvis-backend branch, tag, or commit
@@ -38,13 +39,22 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Collect remote pre-deployment diagnostics
-        continue-on-error: ${{ github.event_name == 'push' || inputs.operation == 'deploy' }}
+        continue-on-error: ${{ github.event_name == 'push' || inputs.operation == 'deploy' || inputs.operation == 'stop' }}
         env:
           SERVER_HOST: ${{ secrets.SERVER_HOST }}
           SERVER_USER: ${{ secrets.SERVER_USER }}
           SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
           SERVER_SSH_KNOWN_HOSTS: ${{ secrets.SERVER_SSH_KNOWN_HOSTS }}
         run: ./deploy/ci/diagnose.sh
+
+      - name: Stop Zenvis on Alibaba Cloud
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.operation == 'stop' }}
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          SERVER_SSH_KNOWN_HOSTS: ${{ secrets.SERVER_SSH_KNOWN_HOSTS }}
+        run: ./deploy/ci/stop-server.sh
 
       - name: Checkout backend
         if: ${{ github.event_name == 'push' || inputs.operation == 'deploy' }}
