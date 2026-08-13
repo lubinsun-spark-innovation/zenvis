@@ -1,0 +1,29 @@
+services:
+  kafka-service:
+    restart: unless-stopped
+
+  redis-service:
+    restart: unless-stopped
+
+  redis-stack-service:
+    restart: unless-stopped
+
+  mysql-service:
+    restart: unless-stopped
+
+  clickhouse-service:
+    restart: unless-stopped
+
+  zenvis-backend:
+    image: ${ZENVIS_BACKEND_IMAGE:?ZENVIS_BACKEND_IMAGE is required}
+    restart: unless-stopped
+
+  vectum-service:
+    restart: unless-stopped
+
+  # The public frontend is hosted by Cloudflare. Keeping this service behind a
+  # profile prevents the Alibaba Cloud host from starting a second frontend.
+  zenvis-frontend:
+    profiles:
+      - server-web-disabled
+    restart: unless-stopped
