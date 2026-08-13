@@ -1,7 +1,7 @@
 name: zenvis
 
 x-common: &common
-  restart: unless-stopped
+  restart: "no"
   networks:
     - zenvis-network
 
@@ -132,7 +132,7 @@ services:
       MYSQL_USER: ${MYSQL_USER:-zenvis}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD is required}
     ports:
-      - "${ZENVIS_INFRA_BIND_ADDRESS:-127.0.0.1}:3306:3306"
+      - "${ZENVIS_INFRA_BIND_ADDRESS:-127.0.0.1}:${MYSQL_PORT:-3306}:3306"
     volumes:
       - /etc/localtime:/etc/localtime:ro
       - ./data/mysql/data:/var/lib/mysql:rw
@@ -205,6 +205,8 @@ services:
       API_BEARER_USER: ${API_BEARER_USER:-admin@admin.com}
       MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN:?MCP_BEARER_TOKEN is required}
       VECTUM_AUTH_TOKEN: ${VECTUM_AUTH_TOKEN:?VECTUM_AUTH_TOKEN is required}
+      LUBINSUN_BASE_URL: ${LUBINSUN_BASE_URL:-http://192.168.100.70:18000/api}
+      LUBINSUN_INTEGRATION_TOKEN: ${LUBINSUN_INTEGRATION_TOKEN:-}
       ZENVIS_BOOTSTRAP_SUPER_ADMIN_PASSWORD: ${ZENVIS_BOOTSTRAP_SUPER_ADMIN_PASSWORD:?bootstrap password is required}
       ZENVIS_BOOTSTRAP_ADMIN_PASSWORD: ${ZENVIS_BOOTSTRAP_ADMIN_PASSWORD:?bootstrap password is required}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
