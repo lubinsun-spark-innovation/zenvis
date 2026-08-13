@@ -38,14 +38,27 @@ known_hosts="$ssh_dir/known_hosts"
 if [[ -n "${SERVER_SSH_KNOWN_HOSTS:-}" ]]; then
   printf '%s\n' "$SERVER_SSH_KNOWN_HOSTS" > "$known_hosts"
 else
-  ssh-keyscan -H "$SERVER_HOST" > "$known_hosts"
+  for attempt in {1..3}; do
+    if ssh-keyscan -T 15 -H "$SERVER_HOST" > "$known_hosts"; then
+      break
+    fi
+    echo "Waiting for the SSH endpoint (${attempt}/3)..." >&2
+    sleep 5
+  done
 fi
+[[ -s "$known_hosts" ]] || {
+  echo "Unable to collect the server SSH host key." >&2
+  exit 1
+}
 chmod 600 "$known_hosts"
 
 ssh_options=(
   -i "$ssh_dir/id_ed25519"
   -o BatchMode=yes
+  -o ConnectTimeout=15
   -o IdentitiesOnly=yes
+  -o ServerAliveInterval=10
+  -o ServerAliveCountMax=6
   -o StrictHostKeyChecking=yes
   -o UserKnownHostsFile="$known_hosts"
 )

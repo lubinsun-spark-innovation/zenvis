@@ -21,8 +21,18 @@ chmod 600 "$work_dir/id_ed25519"
 if [[ -n "${SERVER_SSH_KNOWN_HOSTS:-}" ]]; then
   printf '%s\n' "$SERVER_SSH_KNOWN_HOSTS" > "$work_dir/known_hosts"
 else
-  ssh-keyscan -H "$SERVER_HOST" > "$work_dir/known_hosts"
+  for attempt in {1..3}; do
+    if ssh-keyscan -T 15 -H "$SERVER_HOST" > "$work_dir/known_hosts"; then
+      break
+    fi
+    echo "Waiting for the SSH endpoint (${attempt}/3)..." >&2
+    sleep 5
+  done
 fi
+[[ -s "$work_dir/known_hosts" ]] || {
+  echo "Unable to collect the server SSH host key." >&2
+  exit 1
+}
 chmod 600 "$work_dir/known_hosts"
 
 ssh \
