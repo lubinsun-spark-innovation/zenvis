@@ -18,6 +18,15 @@ services=(
   zenvis-backend
   vectum-service
 )
+containers=(
+  kafka-service
+  redis-signal
+  redis-stack-signal
+  mysql8
+  clickhouse-service
+  zenvis-backend
+  vectum-service
+)
 stage_dir=$(mktemp -d)
 backup_file=""
 
@@ -57,12 +66,21 @@ random_hex() {
 
 rollback() {
   local exit_code=$?
-  echo "Deployment failed; collecting backend logs and restoring the previous release." >&2
-  docker compose \
+  echo "Deployment failed; collecting bounded diagnostics and restoring the previous release." >&2
+  timeout 10s docker compose \
     --project-directory "$APP_DIR" \
     -f "$APP_DIR/docker-compose.yml" \
     -f "$APP_DIR/docker-compose.production.yml" \
-    logs --tail=160 zenvis-backend >&2 || true
+    ps >&2 || true
+
+  for container in "${containers[@]}"; do
+    echo "=== ${container} state ===" >&2
+    timeout 5s docker inspect --format \
+      'status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}n/a{{end}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}} error={{.State.Error}}' \
+      "$container" >&2 || true
+    echo "=== ${container} logs (tail 80) ===" >&2
+    timeout 8s docker logs --tail=80 "$container" >&2 || true
+  done
 
   if [[ -n "$backup_file" && -f "$backup_file" ]]; then
     tar -C "$APP_DIR" -xzf "$backup_file" || true
@@ -148,15 +166,15 @@ compose=(
   vectum-service
 "${compose[@]}" up -d --remove-orphans "${services[@]}"
 
-for attempt in {1..60}; do
-  if curl -fsS --max-time 5 \
+for attempt in {1..36}; do
+  if timeout 5s curl -fsS --connect-timeout 2 --max-time 3 \
     http://127.0.0.1:11001/actuator/health/readiness >/dev/null; then
     printf '%s\n' "$IMAGE_TAG" > "$APP_DIR/.deployed-backend-sha"
     trap - ERR
     echo "Zenvis backend ${IMAGE_TAG} is ready on 127.0.0.1:11001."
     exit 0
   fi
-  echo "Waiting for Zenvis backend readiness (${attempt}/60)..."
+  echo "Waiting for Zenvis backend readiness (${attempt}/36)..."
   sleep 5
 done
 
