@@ -13,10 +13,26 @@ services:
 
   clickhouse-service:
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
 
   zenvis-backend:
     image: ${ZENVIS_BACKEND_IMAGE:?ZENVIS_BACKEND_IMAGE is required}
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4G
+        reservations:
+          cpus: "0.5"
+          memory: 1G
 
   vectum-service:
     restart: unless-stopped

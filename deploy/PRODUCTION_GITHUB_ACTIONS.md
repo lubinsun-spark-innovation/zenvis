@@ -5,6 +5,7 @@
 - 前端由 Cloudflare Workers Static Assets 托管，域名为 `soc.lubinsun.2333123.xyz`。
 - Worker 将同域的 `/zenvis/*` 请求转发到 `https://apisoc.lubinsun.2333123.xyz/*`，沿用前端现有的 Cookie 和接口路径约定。
 - 阿里云服务器运行 Kafka、Redis、Redis Stack、MySQL、ClickHouse、Zenvis 后端和 Vectum。
+- 生产覆盖将 ClickHouse 和后端的 CPU 上限限制为 2 核、内存上限限制为 4 GiB，适配当前阿里云主机规格。
 - 后端只监听 `127.0.0.1:11001`，公网入口由已经配置好的 `apisoc.lubinsun.2333123.xyz` 反向代理提供。
 - 生产数据保存在服务器 `/root/lubinsun/zenvis/data`，每次发布只更新镜像、编排文件和版本化配置，不覆盖数据目录。
 
