@@ -1,5 +1,10 @@
 # Zenvis GitHub Actions 生产部署
 
+> 状态：阿里云 VPS 自动部署已于 2026-08-13 停用。目标主机仅有
+> 3.4 GiB 内存且未配置 Swap，完整 Zenvis 服务启动后系统负载超过 14，
+> 并影响同机 lubinsun_agent 和 SSH。服务器上的 Zenvis 容器已移除，
+> `data` 与备份目录保留；后续请使用独立主机或扩容后再恢复此方案。
+
 ## 架构
 
 - 前端由 Cloudflare Workers Static Assets 托管，域名为 `soc.lubinsun.2333123.xyz`。
