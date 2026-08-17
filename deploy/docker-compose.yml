@@ -196,6 +196,8 @@ services:
     <<: *common
     image: ${ZENVIS_IMAGE_REGISTRY:?run ./zenvisctl compose init}/zenvis-backend:${ZENVIS_VERSION:-latest}-${ARCH:?ARCH is required}
     container_name: zenvis-backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       TZ: ${TZ:-Asia/Shanghai}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD is required}
@@ -205,7 +207,7 @@ services:
       API_BEARER_USER: ${API_BEARER_USER:-admin@admin.com}
       MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN:?MCP_BEARER_TOKEN is required}
       VECTUM_AUTH_TOKEN: ${VECTUM_AUTH_TOKEN:?VECTUM_AUTH_TOKEN is required}
-      LUBINSUN_BASE_URL: ${LUBINSUN_BASE_URL:-http://192.168.100.70:18000/api}
+      LUBINSUN_BASE_URL: ${LUBINSUN_BASE_URL:-http://host.docker.internal:18000/api}
       LUBINSUN_INTEGRATION_TOKEN: ${LUBINSUN_INTEGRATION_TOKEN:-}
       ZENVIS_BOOTSTRAP_SUPER_ADMIN_PASSWORD: ${ZENVIS_BOOTSTRAP_SUPER_ADMIN_PASSWORD:?bootstrap password is required}
       ZENVIS_BOOTSTRAP_ADMIN_PASSWORD: ${ZENVIS_BOOTSTRAP_ADMIN_PASSWORD:?bootstrap password is required}
