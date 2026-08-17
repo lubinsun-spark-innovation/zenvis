@@ -8,12 +8,12 @@ ZenVis 插件把数据模型、接入任务、动态 API、低代码页面、看
 外部数据或业务规范
         │
         ▼
-插件包（index.json + 00_doc … 08_menu）
+插件包（index.json UI 契约 + 00_doc … 08_menu）
         │
         ├── Meta ───────────────→ ClickHouse / Retrieval
         ├── Push Task ──────────→ Vectum / Kafka / ClickHouse
         ├── Dynamic API ────────→ Spring Bean / REST
-        ├── UI / Dashboard ─────→ 低代码容器 / HTML 页面
+        ├── UI / Dashboard ─────→ 主站标准容器 / 沉浸式大屏
         ├── MCP / Skill ────────→ DIH / Agent 工具调用
         └── Menu / Document ────→ 权限入口 / RAG
 ```
@@ -28,7 +28,7 @@ ZenVis 插件把数据模型、接入任务、动态 API、低代码页面、看
 | [Meta 与数据建模](/03-插件开发与集成/Meta与数据建模.md) | 如何把数据规范映射为 Entity、Attribute 和 ClickHouse 表 |
 | [数据接入与推送任务](/03-插件开发与集成/数据接入与推送任务.md) | 如何设计 Source、Kafka、转换、ClickHouse 和 DLQ 链路 |
 | [动态 API 与数据迁移](/03-插件开发与集成/动态API与数据迁移.md) | 如何开发插件 REST API、薄 JAR 和 MySQL 迁移 |
-| [UI、看板与菜单](/03-插件开发与集成/UI看板与菜单.md) | 如何组织低代码应用、独立页面、HTML 看板和权限入口 |
+| [UI、看板与菜单](/03-插件开发与集成/UI看板与菜单.md) | 如何让普通插件页继承主站 UI，并为驾驶舱、大屏和外部应用选择正确容器 |
 | [MCP 与 Skill 集成](/03-插件开发与集成/MCP与Skill集成.md) | 如何声明外部 MCP、运行时 Skill、工具范围和聊天入口 |
 | [生命周期与发布验证](/03-插件开发与集成/生命周期与发布验证.md) | 如何安装、升级、恢复、卸载、打包、检查和排障 |
 

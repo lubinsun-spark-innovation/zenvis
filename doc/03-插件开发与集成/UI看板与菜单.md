@@ -2,6 +2,21 @@
 
 插件可以提供低代码应用、独立低代码页面、Dashboard 和菜单入口。页面引用逻辑 Entity 与 Attribute，不直接绑定 ClickHouse 物理列。
 
+## 统一 UI 契约
+
+平台主站是普通业务页面的唯一视觉基线。插件应继承宿主提供的颜色、字体、间距、圆角、阴影、密度、响应式断点和组件状态，不再为每个插件复制一套主题。
+
+| Profile | 适用资源 | 视觉责任 |
+| --- | --- | --- |
+| `STANDARD` | `LOW_CODE_APP`、`LOW_CODE_PAGE`、普通 `HTML_PAGE` | 宿主注入标准样式、Token 和上下文；插件只组合通用组件与业务内容 |
+| `IMMERSIVE` | 明确要求独立视觉的驾驶舱、监控大屏、全屏态势页 | 插件自己管理页面主题；宿主仅提供容器、安全和上下文协议 |
+| `EXTERNAL` | `LINK`、`EXTERNAL_APP` | 外部应用负责视觉；宿主不注入样式 |
+| `LEGACY_UNSPECIFIED` | 仅用于缺失声明的旧资源 | 平台保留原行为并告警；新增和升级资源不应主动选择 |
+
+新插件的默认选择是 `STANDARD`。只有用户价值确实依赖沉浸式布局时才选择 `IMMERSIVE`，不得把“还原旧插件样式”当作理由。
+
+`STANDARD` 页面只使用当前宿主契约的通用类名：`zv-page`、`zv-workspace`、`zv-visual-page`、`zv-crud-workspace`、`zv-hero`、`zv-hero__chips`、`zv-hero__status`、`zv-summary-bar`、`zv-summary-metric`、`zv-summary-copy`、`zv-metric-card`、`zv-chart-card`、`zv-table-shell`、`zv-truncate` 和 `zv-wrap`。不要在宿主适配器中增加包名、厂商名或具体插件选择器。
+
 ## 04_ui 两种布局
 
 ### 新版多配置目录
@@ -110,9 +125,9 @@ GET /zenvis/api/v1/entity/example_event/{record_id}/view
 
 | 类型 | 关键字段 | 说明 |
 | --- | --- | --- |
-| `LOW_CODE_PAGE` | `config_index` | 读取 `low-code/<config_index>_config/` |
-| `HTML_PAGE` | `html_path` | 读取 `html-page/` 下的相对文件 |
-| `LINK` | `url` | 受控外部链接 |
+| `LOW_CODE_PAGE` | `config_index`、`ui_profile: "STANDARD"` | 读取 `low-code/<config_index>_config/`，必须继承宿主 UI |
+| `HTML_PAGE` | `html_path`、`ui_profile` | 读取 `html-page/` 下的相对文件；显式选择 `STANDARD` 或 `IMMERSIVE` |
+| `LINK` | `url`、`ui_profile: "EXTERNAL"` | 受控外部链接 |
 | `BUILT` | 平台内置配置 | 通常不由业务插件创建 |
 
 ### HTML 看板
@@ -123,7 +138,8 @@ GET /zenvis/api/v1/entity/example_event/{record_id}/view
     "name": "示例安全态势",
     "code": "com.example.plugin.analytics.dashboard.security-overview",
     "type": "HTML_PAGE",
-    "html_path": "security-overview.html"
+    "html_path": "security-overview.html",
+    "ui_profile": "IMMERSIVE"
   }
 ]
 ```
@@ -136,7 +152,7 @@ GET /zenvis/api/v1/entity/example_event/{record_id}/view
 
 `html_path` 只填写相对于 `html-page` 的路径，不添加包名、部署前缀、`/html-page/` 或绝对 URL。安装器会复制文件并生成运行时路径。
 
-HTML 看板应：
+HTML 看板只在驾驶舱、大屏或宿主低代码容器无法表达的交互中使用。普通看板默认使用 `STANDARD` 低代码页。`IMMERSIVE` HTML 看板应：
 
 - 使用真实 ZenVis API 和当前登录 Session；
 - 提供加载、空数据、失败、最后更新时间和手动刷新状态；
@@ -153,7 +169,8 @@ HTML 看板应：
     "name": "示例分析",
     "code": "com.example.plugin.analytics.dashboard.low-code",
     "type": "LOW_CODE_PAGE",
-    "config_index": "com.example.plugin.analytics.dashboard"
+    "config_index": "com.example.plugin.analytics.dashboard",
+    "ui_profile": "STANDARD"
   }
 ]
 ```
@@ -173,12 +190,14 @@ Dashboard `code` 全局唯一并保持稳定。升级时平台用它匹配原看
   {
     "name": "示例事件管理",
     "type": "LOW_CODE_APP",
-    "params": "com.example.plugin.analytics.app"
+    "params": "com.example.plugin.analytics.app",
+    "ui_profile": "STANDARD"
   },
   {
     "name": "事件详情查询",
     "type": "LOW_CODE_PAGE",
-    "params": "com.example.plugin.analytics.detail-event"
+    "params": "com.example.plugin.analytics.detail-event",
+    "ui_profile": "STANDARD"
   }
 ]
 ```
@@ -233,6 +252,9 @@ Dashboard `code` 全局唯一并保持稳定。升级时平台用它匹配原看
 - 子目录名不带 `_config`，所有引用使用完整配置索引。
 - Entity 列表、详情页、Meta 链接和 API 路径一致。
 - Dashboard Code 唯一，HTML 路径为插件内相对路径。
+- 每个 Dashboard 和 Menu 显式声明与类型兼容的 `ui_profile`。
+- `STANDARD` 页面无插件专属主题、硬编码品牌色或宿主中的业务选择器。
+- `IMMERSIVE` 仅用于经确认的驾驶舱、监控大屏和全屏态势页。
 - Menu Type、Params 和实际页面类型一致。
 - 安装后已为目标角色分配菜单。
 - 页面覆盖加载、空数据、错误和刷新状态。

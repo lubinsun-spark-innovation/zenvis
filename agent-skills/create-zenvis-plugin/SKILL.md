@@ -1,6 +1,6 @@
 ---
 name: create-zenvis-plugin
-description: Create, update, review, validate, and package Zenvis plugins from vendor data dictionaries or integration specifications. Use when an agent needs to build or modify a project under zenvis-plugin, define one-to-one entities and Meta attributes, create Vector YAML ingestion services, add low-code applications or IP statistics pages, configure static HTML dashboards, update plugin documentation, or verify a Zenvis plugin archive against the current backend and frontend contracts.
+description: Create, update, review, validate, and package Zenvis plugins from vendor data dictionaries or integration specifications. Use when an agent needs to build or modify a project under zenvis-plugin, define one-to-one entities and Meta attributes, create Vector YAML ingestion services, add host-styled low-code applications or IP statistics pages, configure exceptional immersive HTML dashboards, update plugin documentation, or verify a Zenvis plugin archive against the current backend and frontend contracts.
 ---
 
 # Create Zenvis Plugin
@@ -12,7 +12,9 @@ Build Zenvis plugins from source specifications while keeping entity models, Vec
 1. Locate the Zenvis workspace and intended plugin directory. Prefer `rg --files` and `rg`.
 2. Read every applicable `AGENTS.md` completely before editing files below it.
 3. Inspect the current platform contracts instead of relying on remembered schemas:
-   - `doc/03-插件开发与集成/plugin-development.md`
+   - `doc/03-插件开发与集成/README.md`
+   - `doc/03-插件开发与集成/插件包规范.md`
+   - `doc/03-插件开发与集成/UI看板与菜单.md`
    - `DashboardDto`, `PluginServiceImpl`, `MenuDto`, push-task DTOs
    - retrieval Meta models such as `DataEntity` and `DataAttribute`
    - frontend dashboard, low-code, table, copy, and URL handling
@@ -36,6 +38,7 @@ Apply these rules:
 - Keep non-structured attachments such as PCAP, archives, and sample files outside ClickHouse unless explicitly requested.
 - Record compatibility aliases, such as a historical directory code, without changing the canonical entity/table identity.
 - Use stable, namespaced identifiers and avoid collisions with existing plugins.
+- Declare the root `ui_contract` for every new or materially upgraded plugin: schema `"1"`, minimum host contract `"1.0.0"`, renderer `"amis@6.7"`, and default profile `"STANDARD"` unless the checked-out platform contract has advanced.
 
 Use this standard layout unless the current repository contract differs:
 
@@ -201,6 +204,11 @@ Register both YAML files in `02_push-task/config.json` with clear names and desc
 
 ## Build UI and IP Investigation
 
+- Default every ordinary application, list, detail, investigation, and dashboard page to the host-owned `STANDARD` profile. Do not create a plugin theme for these pages.
+- Use only the generic `zv-*` classes documented by the current UI contract. Never add a package-, vendor-, or plugin-specific selector to the host adapter.
+- Consume host tokens for color, typography, spacing, radius, shadow, density, breakpoints, and states. Do not hard-code a competing palette or redefine root theme variables in a standard page.
+- Reserve `IMMERSIVE` for an explicitly requested cockpit, monitoring wall, or full-screen situational display whose value depends on independent visual composition. Use `EXTERNAL` only for links or external apps. Treat `LEGACY_UNSPECIFIED` as compatibility input, never as new output.
+- Add a compatible `ui_profile` to every dashboard and menu declaration. `LOW_CODE_APP` and `LOW_CODE_PAGE` require `STANDARD`; `LINK` and `EXTERNAL_APP` require `EXTERNAL`; `HTML_PAGE` must explicitly select `STANDARD` or `IMMERSIVE`.
 - Create a distinct list page for every structured entity.
 - Include every entity in the low-code app navigation.
 - Keep API entity names aligned with Meta; do not use a combined endpoint as a shortcut.
@@ -220,13 +228,14 @@ Validate the low-code schema shape expected by the current SDK. In particular, d
 
 ## Build Dashboards
 
-Use a self-contained static HTML single page by default unless the user requests low-code or an external link.
+Use a host-styled `STANDARD` low-code page by default. Create a self-contained static HTML page only when the user explicitly needs an `IMMERSIVE` cockpit, monitoring wall, or full-screen situational display that the standard renderer cannot express.
 
 For `05_dashboard/config.json`:
 
 - Use a JSON array compatible with the current `DashboardDto`.
 - Use snake_case fields such as `config_index` and `html_path`.
 - Provide a globally unique, package-namespaced `code`.
+- Set `ui_profile` explicitly and keep it compatible with the dashboard type.
 - For `HTML_PAGE`, make `html_path` represent only the plugin-package-relative file path:
 
 ```json
@@ -235,7 +244,8 @@ For `05_dashboard/config.json`:
     "name": "安全态势总览",
     "code": "com.example.plugin.dashboard.security-overview",
     "type": "HTML_PAGE",
-    "html_path": "security-overview.html"
+    "html_path": "security-overview.html",
+    "ui_profile": "IMMERSIVE"
   }
 ]
 ```
@@ -244,7 +254,7 @@ For `05_dashboard/config.json`:
 - Do not put `/html-page/`, `/zenvis/html-page/`, the package name, or a deployment URL in `html_path` unless the checked-out installer contract explicitly says otherwise.
 - Allow the installer to copy the file and derive its runtime public URL.
 
-For the HTML page:
+For an immersive HTML page:
 
 - Use actual Zenvis APIs and current login-session behavior; do not present demo values as real data.
 - Keep CSS and JavaScript self-contained unless external assets are explicitly allowed.
@@ -269,17 +279,18 @@ For the HTML page:
 Run validation proportional to the change:
 
 1. Parse every JSON file.
-2. Parse YAML and run `vector validate` using the production Vector version or container when available.
-3. Confirm entity count equals the structured-definition count.
-4. Confirm entity names, tables, Kafka topics, transforms, sinks, UI pages, and dashboard entity lists are aligned.
-5. Compare every transform output field with the corresponding Meta attributes; report missing and extra fields.
-6. Run the complete “Validate Meta as a contract” checklist, including first-attribute detail links, IP links, copy flags, and reserved-field exclusions.
-7. Generate representative data for every definition and exercise source → Kafka → ClickHouse when infrastructure is available.
-8. Run targeted backend/frontend tests for any platform changes.
-9. Compile inline dashboard JavaScript and perform browser visual QA for material dashboard changes.
-10. Remove packaging noise such as `.DS_Store`.
-11. Build the plugin with the repository’s build script.
-12. Inspect the archive itself, not only the source tree:
+2. Validate the root `ui_contract` and every `ui_profile` against the checked-out backend contract. Confirm standard pages use only generic host classes and tokens.
+3. Parse YAML and run `vector validate` using the production Vector version or container when available.
+4. Confirm entity count equals the structured-definition count.
+5. Confirm entity names, tables, Kafka topics, transforms, sinks, UI pages, and dashboard entity lists are aligned.
+6. Compare every transform output field with the corresponding Meta attributes; report missing and extra fields.
+7. Run the complete “Validate Meta as a contract” checklist, including first-attribute detail links, IP links, copy flags, and reserved-field exclusions.
+8. Generate representative data for every definition and exercise source → Kafka → ClickHouse when infrastructure is available.
+9. Run targeted backend/frontend tests for any platform changes.
+10. Compile inline dashboard JavaScript and perform browser visual QA for material dashboard changes.
+11. Remove packaging noise such as `.DS_Store`.
+12. Build the plugin with the repository’s build script.
+13. Inspect the archive itself, not only the source tree:
     - verify `index.json` and version;
     - verify the latest Meta, push-task, UI, dashboard, and menu configs;
     - verify static HTML and documentation are present;
