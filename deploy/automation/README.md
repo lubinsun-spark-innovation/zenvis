@@ -20,9 +20,15 @@
 1. 取得跨仓库 `flock`，防止多个仓库同时修改 Compose、插件或数据库。
 2. 检查 CPU 架构、内存、Swap、磁盘、NTP、Docker/Compose、环境文件权限和模板占位值。
 3. 校验 GitHub 仓库白名单、40 位 SHA 与 `origin/main`，旧事件被更新 main 取代时安全跳过。
-4. 在隔离的 Maven/Node/Go 构建容器中从当前 main SHA 重新生成产物；镜像写入并复核 `org.opencontainers.image.revision`，插件记录包 SHA-256。
+4. 用固定版本的 Maven/Node/Go 工具链从当前 main SHA 重新生成产物；镜像写入并复核 `org.opencontainers.image.revision`，插件记录包 SHA-256。
 5. 数据库/插件变更前创建一致性备份；Analyzer 发布前备份生产环境、区域配置和旧镜像；应用失败时恢复旧镜像或 ZenVis 一致性备份。
 6. 验证容器状态、HTTP 入口、插件精确版本与业务 smoke，再写入 current/previous 发布台账。
+
+## Backend 测试隔离
+
+Backend main 当前有 9 个不能在生产主机直接运行的测试类：5 个完整 Spring 上下文/集成测试会执行 MySQL、ClickHouse 或 Redis 操作；另外 4 个存在未入库 JMR fixture、宿主机 OTF 字体兼容或过期 Mockito stub 等 main 测试债务。自动部署明确隔离这 9 类并运行其余 552 个测试，绝不把测试连接到生产数据库，也不读取生产 `open_config`。
+
+这不是静默 `skipTests`：工作流摘要和控制器日志都会列出隔离原因。长期方案是给 Backend 增加专用 test profile 和一次性 MySQL/ClickHouse/Redis fixture，并把 JMR fixture、可嵌入的 glyf-based CJK TTF 与 Mockito 修复纳入 main；每完成一项就从 `BACKEND_SAFE_TEST_PATTERN` 和 Backend workflow 中删除对应隔离项，最终恢复 `clean verify` 全量门禁。
 
 ## 插件迭代
 

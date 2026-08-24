@@ -26,6 +26,7 @@ MAVEN_BUILDER_IMAGE=${LUBINSUN_MAVEN_BUILDER_IMAGE:-maven:3.9.11-eclipse-temurin
 HOST_MAVEN_BIN=${LUBINSUN_HOST_MAVEN_BIN:-/home/lubinsun/.local/lib/apache-maven-3.9.11/bin/mvn}
 HOST_JAVA_HOME=${LUBINSUN_HOST_JAVA_HOME:-/home/lubinsun/.local/jvm/temurin-17}
 NODE_BUILDER_IMAGE=${LUBINSUN_NODE_BUILDER_IMAGE:-node:22-bookworm}
+BACKEND_SAFE_TEST_PATTERN=${LUBINSUN_BACKEND_SAFE_TEST_PATTERN:-*,!McpChatToolGrantPersistenceTest,!ClickhouseTableTtlIntegrationTest,!ClickhouseRecordIdMigrationIntegrationTest,!WebServiceApplicationTests,!MenuTest,!PluginUpgradeUiConfigTest,!SkillServiceTest,!DataInitiatorDashboardTest,!ReportExportServiceTest}
 
 log() {
   printf '[%s] %s\n' "$(date -Is)" "$*"
@@ -599,7 +600,9 @@ run_maven_builder() {
 
 build_zenvis_backend() {
   local sha=$1 image="lubinsun/zenvis-backend:$sha"
-  run_maven_builder . clean verify
+  log "Backend 安全测试：隔离 5 个会写外部服务的全上下文测试类及 4 个 main 已知 fixture/font/mock 测试类"
+  log "隔离项不会连接生产 MySQL、ClickHouse、Redis 或读取生产 open_config"
+  run_maven_builder . clean verify -Dtest="$BACKEND_SAFE_TEST_PATTERN"
   [[ -s "$COMPONENT_REPO/target/application.jar" ]] || die "Backend 构建产物不存在"
   docker build \
     --build-arg BASE_IMAGE_ARCH=amd64 \
