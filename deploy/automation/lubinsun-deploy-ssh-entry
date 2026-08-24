@@ -23,6 +23,7 @@ case "$component" in
   zenvis) expected_repository=lubinsun-spark-innovation/zenvis ;;
   zenvis-backend) expected_repository=lubinsun-spark-innovation/zenvis-backend ;;
   zenvis-frontend) expected_repository=lubinsun-spark-innovation/zenvis-frontend ;;
+  zenvis-analyzer) expected_repository=lubinsun-spark-innovation/zenvis-service-analyzer ;;
   plugin-onesoc) expected_repository=lubinsun-spark-innovation/zenvis-plugin-onesoc ;;
   plugin-lubinsun) expected_repository=lubinsun-spark-innovation/zenvis-plugin-lubinsun ;;
   lubinsun-agent) expected_repository=lubinsun-spark-innovation/lubinsun_agent ;;

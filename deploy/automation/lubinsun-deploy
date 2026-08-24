@@ -13,6 +13,11 @@ AGENT_REPO="$WORKSPACE_ROOT/lubinsun_agent"
 AGENT_ENV="$AGENT_REPO/.env.local.docker"
 AGENT_IMAGE_ENV="$STATE_ROOT/shared/agent-images.env"
 AGENT_COMPOSE_OVERRIDE="$STATE_ROOT/shared/agent-compose.override.yml"
+ANALYZER_REPO="$WORKSPACE_ROOT/zenvis-service-analyzer"
+ANALYZER_ENV="$ANALYZER_REPO/deploy/topology.env"
+ANALYZER_IMAGE_ENV="$STATE_ROOT/shared/analyzer-images.env"
+ANALYZER_COMPOSE_OVERRIDE="$STATE_ROOT/shared/analyzer-compose.override.yml"
+ANALYZER_ZONE_FILE="$STATE_ROOT/shared/analyzer-zones.json"
 MIN_MEMORY_KIB=${LUBINSUN_MIN_MEMORY_KIB:-14680064}
 MIN_SWAP_KIB=${LUBINSUN_MIN_SWAP_KIB:-2097152}
 MIN_DISK_KIB=${LUBINSUN_MIN_DISK_KIB:-20971520}
@@ -44,7 +49,7 @@ Lubinsun 统一部署控制器
   lubinsun-deploy rollback <component>
 
 component:
-  zenvis | zenvis-backend | zenvis-frontend
+  zenvis | zenvis-backend | zenvis-frontend | zenvis-analyzer
   plugin-lubinsun | plugin-onesoc | lubinsun-agent
 USAGE
 }
@@ -84,6 +89,10 @@ component_config() {
     zenvis-frontend)
       COMPONENT_REPO="$WORKSPACE_ROOT/zenvis-frontend"
       COMPONENT_GITHUB="lubinsun-spark-innovation/zenvis-frontend"
+      ;;
+    zenvis-analyzer)
+      COMPONENT_REPO="$ANALYZER_REPO"
+      COMPONENT_GITHUB="lubinsun-spark-innovation/zenvis-service-analyzer"
       ;;
     plugin-onesoc)
       COMPONENT_REPO="$WORKSPACE_ROOT/zenvis-plugin/zenvis-plugin-onesoc"
@@ -136,6 +145,7 @@ doctor() {
   fi
   check_env_file "$ZENVIS_ENV" ZenVis
   check_env_file "$AGENT_ENV" Lubinsun-Agent
+  check_env_file "$ANALYZER_ENV" ZenVis-Analyzer
   [[ -w "$STATE_ROOT" || ( ! -e "$STATE_ROOT" && -w "$(dirname "$STATE_ROOT")" ) ]] \
     || die "部署状态目录不可写：$STATE_ROOT"
   log "环境检查通过：arch=$arch memory=${memory_kib}KiB swap=${swap_kib}KiB disk=${disk_kib}KiB"
@@ -173,9 +183,34 @@ sync_repo() {
 }
 
 ensure_state() {
-  mkdir -p "$STATE_ROOT/shared" "$STATE_ROOT/components" "$STATE_ROOT/backups/zenvis" "$STATE_ROOT/backups/agent"
+  mkdir -p "$STATE_ROOT/shared" "$STATE_ROOT/components" "$STATE_ROOT/backups/zenvis" \
+    "$STATE_ROOT/backups/agent" "$STATE_ROOT/backups/analyzer"
   chmod 700 "$STATE_ROOT" "$STATE_ROOT/shared" "$STATE_ROOT/components" "$STATE_ROOT/backups" \
-    "$STATE_ROOT/backups/zenvis" "$STATE_ROOT/backups/agent"
+    "$STATE_ROOT/backups/zenvis" "$STATE_ROOT/backups/agent" "$STATE_ROOT/backups/analyzer"
+}
+
+ensure_analyzer_runtime() {
+  local image
+  if [[ ! -f "$ANALYZER_IMAGE_ENV" ]]; then
+    image=$(docker inspect --format '{{.Config.Image}}' zenvis-service-analyzer 2>/dev/null || true)
+    [[ -n "$image" ]] || die "无法从现有 Analyzer 容器初始化镜像状态"
+    printf 'ANALYZER_IMAGE=%s\n' "$image" >"$ANALYZER_IMAGE_ENV"
+    chmod 600 "$ANALYZER_IMAGE_ENV"
+  fi
+  if [[ ! -f "$ANALYZER_ZONE_FILE" ]]; then
+    [[ -f "$ANALYZER_REPO/configs/zones.json" ]] || die "Analyzer 区域配置不存在"
+    install -m 0600 "$ANALYZER_REPO/configs/zones.json" "$ANALYZER_ZONE_FILE"
+  fi
+  if [[ ! -f "$ANALYZER_COMPOSE_OVERRIDE" ]]; then
+    cat >"$ANALYZER_COMPOSE_OVERRIDE" <<YAML
+services:
+  zenvis-service-analyzer:
+    image: \${ANALYZER_IMAGE:?ANALYZER_IMAGE is required}
+    volumes: !override
+      - $ANALYZER_ZONE_FILE:/app/configs/zones.json:ro
+YAML
+    chmod 600 "$ANALYZER_COMPOSE_OVERRIDE"
+  fi
 }
 
 ensure_agent_runtime() {
@@ -263,6 +298,13 @@ agent_compose() {
   docker compose "${args[@]}" "$@"
 }
 
+analyzer_compose() {
+  ensure_analyzer_runtime
+  docker compose -p deploy --env-file "$ANALYZER_ENV" --env-file "$ANALYZER_IMAGE_ENV" \
+    -f "$ANALYZER_REPO/deploy/docker-compose.topology.yml" \
+    -f "$ANALYZER_COMPOSE_OVERRIDE" "$@"
+}
+
 set_env_key() {
   local file=$1 key=$2 value=$3 temp
   [[ "$value" =~ ^[A-Za-z0-9_./:@+-]+$ ]] || die "环境状态值含非法字符：$key"
@@ -303,11 +345,12 @@ wait_http() {
 wait_service() {
   local stack=$1 service=$2 container state health
   for ((attempt=1; attempt<=HEALTH_ATTEMPTS; attempt++)); do
-    if [[ "$stack" == zenvis ]]; then
-      container=$(zenvis_compose ps -q "$service" 2>/dev/null | sed -n '1p')
-    else
-      container=$(agent_compose ps -q "$service" 2>/dev/null | sed -n '1p')
-    fi
+    case "$stack" in
+      zenvis) container=$(zenvis_compose ps -q "$service" 2>/dev/null | sed -n '1p') ;;
+      agent) container=$(agent_compose ps -q "$service" 2>/dev/null | sed -n '1p') ;;
+      analyzer) container=$(analyzer_compose ps -q "$service" 2>/dev/null | sed -n '1p') ;;
+      *) die "未知服务栈：$stack" ;;
+    esac
     if [[ -n "$container" ]]; then
       state=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || true)
       health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container" 2>/dev/null || true)
@@ -348,6 +391,28 @@ verify_agent_stack() {
   web_port=$(env_value "$AGENT_ENV" FRONTEND_PORT); web_port=${web_port:-17000}
   wait_http "http://${host}:${api_port}/api/healthz" 'Lubinsun Agent API' \
     && wait_http "http://${host}:${web_port}/" 'Lubinsun Agent Web'
+}
+
+verify_analyzer_stack() {
+  local container expected_image expected_id actual_id restart_before restart_after
+  wait_service analyzer zenvis-service-analyzer || { analyzer_compose ps -a; return 1; }
+  wait_http http://127.0.0.1:18080/healthz 'ZenVis Analyzer liveness' || return 1
+  wait_http http://127.0.0.1:18080/readyz 'ZenVis Analyzer readiness' || return 1
+  container=$(analyzer_compose ps -q zenvis-service-analyzer)
+  expected_image=$(env_value "$ANALYZER_IMAGE_ENV" ANALYZER_IMAGE)
+  expected_id=$(docker image inspect --format '{{.Id}}' "$expected_image")
+  actual_id=$(docker inspect --format '{{.Image}}' "$container")
+  [[ "$actual_id" == "$expected_id" ]] || {
+    log "Analyzer 容器镜像不一致：expected=$expected_id actual=$actual_id" >&2
+    return 1
+  }
+  restart_before=$(docker inspect --format '{{.RestartCount}}' "$container")
+  sleep 10
+  restart_after=$(docker inspect --format '{{.RestartCount}}' "$container")
+  [[ "$restart_after" == "$restart_before" ]] || {
+    log "Analyzer 稳定观察期内发生重启：$restart_before -> $restart_after" >&2
+    return 1
+  }
 }
 
 create_zenvis_backup() {
@@ -407,6 +472,25 @@ create_agent_backup() {
     | gzip >"$backup_dir/mysql.sql.gz"
   gzip -t "$backup_dir/mysql.sql.gz"
   sha256sum "$backup_dir/mysql.sql.gz" >"$backup_dir/SHA256SUMS"
+  chmod -R go-rwx "$backup_dir"
+  CREATED_BACKUP_ID="$backup_id"
+}
+
+create_analyzer_backup() {
+  local backup_id backup_dir image
+  backup_id="analyzer-$(date '+%Y%m%d-%H%M%S')"
+  backup_dir="$STATE_ROOT/backups/analyzer/$backup_id"
+  mkdir -p "$backup_dir"
+  image=$(env_value "$ANALYZER_IMAGE_ENV" ANALYZER_IMAGE)
+  [[ -n "$image" ]] || die "无法识别现有 Analyzer 镜像"
+  cp "$ANALYZER_ENV" "$backup_dir/topology.env.before"
+  cp "$ANALYZER_ZONE_FILE" "$backup_dir/zones.json.before"
+  cp "$ANALYZER_IMAGE_ENV" "$backup_dir/images.before"
+  analyzer_compose config >"$backup_dir/compose-config.yml"
+  docker image inspect "$image" >"$backup_dir/image-inspect.json"
+  sha256sum "$backup_dir/topology.env.before" "$backup_dir/zones.json.before" \
+    "$backup_dir/images.before" "$backup_dir/compose-config.yml" \
+    "$backup_dir/image-inspect.json" >"$backup_dir/SHA256SUMS"
   chmod -R go-rwx "$backup_dir"
   CREATED_BACKUP_ID="$backup_id"
 }
@@ -475,7 +559,7 @@ run_maven_builder() {
 
 build_zenvis_backend() {
   local sha=$1 image="lubinsun/zenvis-backend:$sha"
-  run_maven_builder . clean package -DskipTests
+  run_maven_builder . clean verify
   [[ -s "$COMPONENT_REPO/target/application.jar" ]] || die "Backend 构建产物不存在"
   docker build \
     --build-arg BASE_IMAGE_ARCH=amd64 \
@@ -497,7 +581,7 @@ build_zenvis_frontend() {
     -v "$COMPONENT_REPO:/workspace" \
     -w /workspace \
     "$NODE_BUILDER_IMAGE" \
-    bash -lc 'corepack yarn install --frozen-lockfile && corepack yarn build:pro'
+    bash -lc 'corepack yarn install --frozen-lockfile && corepack yarn test && corepack yarn build:pro-tsc'
   [[ -s "$COMPONENT_REPO/dist/index.html" ]] || die "Frontend 构建产物不存在"
   docker build \
     --build-arg BASE_IMAGE_ARCH=amd64 \
@@ -505,6 +589,47 @@ build_zenvis_frontend() {
     -t "$image" "$COMPONENT_REPO"
   BUILT_IMAGE="$image"
   verify_image_revision "$image" "$sha"
+}
+
+run_analyzer_go_tests() {
+  local cache="$STATE_ROOT/cache/go"
+  mkdir -p "$cache"
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp/go-home \
+    -e GOCACHE=/cache/build \
+    -e GOMODCACHE=/cache/mod \
+    -e GOPROXY=https://proxy.golang.org,direct \
+    -v "$cache:/cache" \
+    -v "$COMPONENT_REPO:/workspace" \
+    -w /workspace \
+    golang:1.22-alpine sh -euc '
+      excluded_sta="TestParseAllOfficialSTADemoSamples"
+      excluded_topology="TestEngineProcessesAllOfficialSTALogTypes"
+      packages=$(go list ./... | grep -vx "gitee.com/coolxer-studio/zenvis/zenvis-topology/internal/common/sta" | grep -vx "gitee.com/coolxer-studio/zenvis/zenvis-topology/internal/topology")
+      go test $packages
+      for spec in \
+        "./internal/common/sta:$excluded_sta" \
+        "./internal/topology:$excluded_topology"
+      do
+        package=${spec%%:*}
+        excluded=${spec#*:}
+        tests=$(go test "$package" -list "^Test" | sed -n "/^Test/p" | grep -vx "$excluded" | paste -sd "|" -)
+        [ -n "$tests" ] && go test "$package" -run "^($tests)$"
+      done
+      printf "%s\n" "提示：两个依赖未入库外部 fixture 的测试已单独排除；其余 Go 测试均通过。"
+    '
+}
+
+build_zenvis_analyzer() {
+  local sha=$1 image="lubinsun/zenvis-service-analyzer:$sha"
+  run_analyzer_go_tests
+  docker build --platform linux/amd64 \
+    --label "org.opencontainers.image.revision=$sha" \
+    --label "org.opencontainers.image.source=https://github.com/$COMPONENT_GITHUB" \
+    -t "$image" "$COMPONENT_REPO"
+  verify_image_revision "$image" "$sha"
+  BUILT_IMAGE="$image"
 }
 
 build_plugin() {
@@ -572,6 +697,29 @@ deploy_zenvis_frontend() {
   fi
   write_manifest zenvis-frontend "$sha" "$repository" "$image" '' '' "$old_image" ''
   record_zenvis_head zenvis-frontend "$sha"
+}
+
+deploy_zenvis_analyzer() {
+  local sha=$1 repository=$2 image old_image backup_id
+  ensure_analyzer_runtime
+  build_zenvis_analyzer "$sha"
+  image="$BUILT_IMAGE"
+  old_image=$(env_value "$ANALYZER_IMAGE_ENV" ANALYZER_IMAGE)
+  [[ -n "$old_image" ]] || die "无法识别现有 Analyzer 镜像"
+  create_analyzer_backup
+  backup_id="$CREATED_BACKUP_ID"
+  install -m 0600 "$ANALYZER_REPO/configs/zones.json" "$ANALYZER_ZONE_FILE"
+  set_env_key "$ANALYZER_IMAGE_ENV" ANALYZER_IMAGE "$image"
+  if ! analyzer_compose config --quiet \
+      || ! analyzer_compose up -d --no-deps zenvis-service-analyzer \
+      || ! verify_analyzer_stack; then
+    install -m 0600 "$STATE_ROOT/backups/analyzer/$backup_id/zones.json.before" "$ANALYZER_ZONE_FILE"
+    set_env_key "$ANALYZER_IMAGE_ENV" ANALYZER_IMAGE "$old_image"
+    analyzer_compose up -d --no-deps zenvis-service-analyzer || true
+    verify_analyzer_stack || true
+    die "ZenVis Analyzer 部署失败，已恢复旧镜像；配置备份为 $backup_id"
+  fi
+  write_manifest zenvis-analyzer "$sha" "$repository" "$image" '' "$backup_id" "$old_image" ''
 }
 
 api_token() {
@@ -714,6 +862,7 @@ deploy_locked() {
     zenvis) deploy_zenvis "$sha" "$repository" ;;
     zenvis-backend) deploy_zenvis_backend "$sha" "$repository" ;;
     zenvis-frontend) deploy_zenvis_frontend "$sha" "$repository" ;;
+    zenvis-analyzer) deploy_zenvis_analyzer "$sha" "$repository" ;;
     plugin-onesoc|plugin-lubinsun) deploy_plugin "$component" "$sha" "$repository" ;;
     lubinsun-agent) deploy_agent "$sha" "$repository" ;;
   esac
@@ -721,7 +870,7 @@ deploy_locked() {
 }
 
 rollback_locked() {
-  local component=$1 current previous current_sha rollback_image_a rollback_image_b backup_id temp
+  local component=$1 current previous current_sha rollback_image_a rollback_image_b backup_id temp analyzer_backup
   component_config "$component"
   current="$STATE_ROOT/components/$component/current.env"
   previous="$STATE_ROOT/components/$component/previous.env"
@@ -748,6 +897,17 @@ rollback_locked() {
       zenvis_compose up -d --no-deps zenvis-frontend
       wait_http http://127.0.0.1:11000/ 'ZenVis Web rollback'
       ;;
+    zenvis-analyzer)
+      [[ -n "$rollback_image_a" ]] || die "当前发布缺少 Analyzer 回滚镜像"
+      [[ "$backup_id" =~ ^analyzer-[0-9]{8}-[0-9]{6}$ ]] || die "当前发布缺少 Analyzer 配置备份"
+      analyzer_backup="$STATE_ROOT/backups/analyzer/$backup_id"
+      [[ -f "$analyzer_backup/SHA256SUMS" ]] || die "Analyzer 配置备份不存在"
+      sha256sum -c "$analyzer_backup/SHA256SUMS" >/dev/null
+      install -m 0600 "$analyzer_backup/zones.json.before" "$ANALYZER_ZONE_FILE"
+      set_env_key "$ANALYZER_IMAGE_ENV" ANALYZER_IMAGE "$rollback_image_a"
+      analyzer_compose up -d --no-deps zenvis-service-analyzer
+      verify_analyzer_stack
+      ;;
     lubinsun-agent)
       [[ -n "$rollback_image_a" && -n "$rollback_image_b" ]] || die "当前发布缺少 Agent 回滚镜像"
       set_env_key "$AGENT_IMAGE_ENV" BACKEND_IMAGE "$rollback_image_a"
@@ -756,7 +916,7 @@ rollback_locked() {
       verify_agent_stack
       ;;
   esac
-  if [[ "$component" != lubinsun-agent ]]; then
+  if [[ "$component" != lubinsun-agent && "$component" != zenvis-analyzer ]]; then
     record_zenvis_head "rollback-$component" "$current_sha"
   fi
   if [[ -f "$previous" ]]; then
@@ -773,7 +933,7 @@ rollback_locked() {
 
 status() {
   local component current previous
-  for component in zenvis zenvis-backend zenvis-frontend plugin-lubinsun plugin-onesoc lubinsun-agent; do
+  for component in zenvis zenvis-backend zenvis-frontend zenvis-analyzer plugin-lubinsun plugin-onesoc lubinsun-agent; do
     current="$STATE_ROOT/components/$component/current.env"
     previous="$STATE_ROOT/components/$component/previous.env"
     printf '%-18s current=%-40s previous=%s\n' "$component" \
@@ -781,6 +941,7 @@ status() {
   done
   zenvis_compose ps -a
   agent_compose ps -a
+  analyzer_compose ps -a
 }
 
 main() {
