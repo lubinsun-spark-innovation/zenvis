@@ -27,6 +27,7 @@ HOST_MAVEN_BIN=${LUBINSUN_HOST_MAVEN_BIN:-/home/lubinsun/.local/lib/apache-maven
 HOST_JAVA_HOME=${LUBINSUN_HOST_JAVA_HOME:-/home/lubinsun/.local/jvm/temurin-17}
 NODE_BUILDER_IMAGE=${LUBINSUN_NODE_BUILDER_IMAGE:-node:22-bookworm}
 HOST_NODE_HOME=${LUBINSUN_HOST_NODE_HOME:-/home/lubinsun/.nvm/versions/node/v24.15.0}
+GO_PROXY=${LUBINSUN_GO_PROXY:-https://goproxy.cn,direct}
 BACKEND_SAFE_TEST_PATTERN=${LUBINSUN_BACKEND_SAFE_TEST_PATTERN:-*,!McpChatToolGrantPersistenceTest,!ClickhouseTableTtlIntegrationTest,!ClickhouseRecordIdMigrationIntegrationTest,!WebServiceApplicationTests,!MenuTest,!PluginUpgradeUiConfigTest,!SkillServiceTest,!DataInitiatorDashboardTest,!ReportExportServiceTest}
 
 log() {
@@ -669,7 +670,7 @@ run_analyzer_go_tests() {
     -e HOME=/tmp/go-home \
     -e GOCACHE=/cache/build \
     -e GOMODCACHE=/cache/mod \
-    -e GOPROXY=https://proxy.golang.org,direct \
+    -e GOPROXY="$GO_PROXY" \
     -v "$cache:/cache" \
     -v "$COMPONENT_REPO:/workspace" \
     -w /workspace \
