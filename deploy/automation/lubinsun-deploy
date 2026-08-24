@@ -12,7 +12,8 @@ ZENVIS_RELEASE_HEAD="$STATE_ROOT/shared/zenvis-release-head.env"
 AGENT_REPO="$WORKSPACE_ROOT/lubinsun_agent"
 AGENT_ENV="$AGENT_REPO/.env.local.docker"
 AGENT_IMAGE_ENV="$STATE_ROOT/shared/agent-images.env"
-AGENT_COMPOSE_OVERRIDE="$STATE_ROOT/shared/agent-compose.override.yml"
+AGENT_RUNTIME_ENV="$STATE_ROOT/shared/agent-runtime.env"
+AGENT_COMPOSE_OVERRIDE="$ZENVIS_REPO/deploy/automation/agent-compose.automation.yml"
 ANALYZER_REPO="$WORKSPACE_ROOT/zenvis-service-analyzer"
 ANALYZER_ENV="$ANALYZER_REPO/deploy/topology.env"
 ANALYZER_IMAGE_ENV="$STATE_ROOT/shared/analyzer-images.env"
@@ -220,7 +221,7 @@ ensure_analyzer_runtime() {
   fi
   if [[ ! -f "$ANALYZER_ZONE_FILE" ]]; then
     [[ -f "$ANALYZER_REPO/configs/zones.json" ]] || die "Analyzer 区域配置不存在"
-    install -m 0600 "$ANALYZER_REPO/configs/zones.json" "$ANALYZER_ZONE_FILE"
+    install -m 0644 "$ANALYZER_REPO/configs/zones.json" "$ANALYZER_ZONE_FILE"
   fi
   if [[ ! -f "$ANALYZER_COMPOSE_OVERRIDE" ]]; then
     cat >"$ANALYZER_COMPOSE_OVERRIDE" <<YAML
@@ -235,7 +236,8 @@ YAML
 }
 
 ensure_agent_runtime() {
-  local backend_image frontend_image
+  local backend_image frontend_image backend_endpoint frontend_endpoint bind_host frontend_bind_host
+  local backend_port frontend_port
   if [[ ! -f "$AGENT_IMAGE_ENV" ]]; then
     backend_image=$(docker inspect --format '{{.Config.Image}}' lubinsun-test-backend-1 2>/dev/null || true)
     frontend_image=$(docker inspect --format '{{.Config.Image}}' lubinsun-test-frontend-1 2>/dev/null || true)
@@ -246,38 +248,27 @@ ensure_agent_runtime() {
     } >"$AGENT_IMAGE_ENV"
     chmod 600 "$AGENT_IMAGE_ENV"
   fi
-  if [[ ! -f "$AGENT_COMPOSE_OVERRIDE" ]]; then
-    cat >"$AGENT_COMPOSE_OVERRIDE" <<YAML
-services:
-  mysql:
-    volumes: !override
-      - $AGENT_REPO/mysql/data:/var/lib/mysql
-      - $AGENT_REPO/mysql/backups:/backups
-  tool-executor-local:
-    volumes: !override
-      - agent-data:/var/lib/lubinsun-agent
-      - tool-executor-local-socket:/run/lubinsun-executor-local
-  tool-executor-standard:
-    volumes: !override
-      - agent-data:/var/lib/lubinsun-agent
-      - tool-executor-standard-socket:/run/lubinsun-executor-standard
-  tool-executor-privileged:
-    volumes: !override
-      - agent-data:/var/lib/lubinsun-agent
-      - tool-executor-privileged-socket:/run/lubinsun-executor-privileged
-  backend:
-    volumes: !override
-      - agent-data:/var/lib/lubinsun-agent
-      - tool-executor-local-socket:/run/lubinsun-executor-local
-      - tool-executor-standard-socket:/run/lubinsun-executor-standard
-      - tool-executor-privileged-socket:/run/lubinsun-executor-privileged
-volumes:
-  agent-data:
-    external: true
-    name: lubinsun-test_agent-data
-YAML
-    chmod 600 "$AGENT_COMPOSE_OVERRIDE"
+  if [[ ! -f "$AGENT_RUNTIME_ENV" ]]; then
+    backend_endpoint=$(docker port lubinsun-test-backend-1 8080/tcp | head -n 1)
+    frontend_endpoint=$(docker port lubinsun-test-frontend-1 80/tcp | head -n 1)
+    [[ -n "$backend_endpoint" && -n "$frontend_endpoint" ]] \
+      || die "无法从现有 Agent 容器初始化发布端口"
+    bind_host=${backend_endpoint%:*}
+    frontend_bind_host=${frontend_endpoint%:*}
+    backend_port=${backend_endpoint##*:}
+    frontend_port=${frontend_endpoint##*:}
+    [[ "$bind_host" == "$frontend_bind_host" ]] || die "Agent 前后端绑定地址不一致"
+    [[ "$bind_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Agent 绑定地址格式异常"
+    [[ "$backend_port" =~ ^[0-9]+$ && "$frontend_port" =~ ^[0-9]+$ ]] \
+      || die "Agent 发布端口格式异常"
+    {
+      printf 'LOCAL_BIND_HOST=%s\n' "$bind_host"
+      printf 'BACKEND_PORT=%s\n' "$backend_port"
+      printf 'FRONTEND_PORT=%s\n' "$frontend_port"
+    } >"$AGENT_RUNTIME_ENV"
+    chmod 600 "$AGENT_RUNTIME_ENV"
   fi
+  [[ -f "$AGENT_COMPOSE_OVERRIDE" ]] || die "Agent 自动化 Compose 覆盖不存在"
 }
 
 ensure_zenvis_images() {
@@ -301,14 +292,10 @@ zenvis_compose() {
 }
 
 agent_compose() {
-  local profile bind_host api_port web_port args
+  local profile args
   ensure_agent_runtime
-  bind_host=$(env_value "$AGENT_ENV" LOCAL_BIND_HOST); bind_host=${bind_host:-127.0.0.1}
-  api_port=$(env_value "$AGENT_ENV" BACKEND_PORT); api_port=${api_port:-18000}
-  web_port=$(env_value "$AGENT_ENV" FRONTEND_PORT); web_port=${web_port:-17000}
-  export API_BIND_HOST="$bind_host" API_PORT="$api_port" WEB_PORT="$web_port"
-  args=(-p lubinsun-test --profile web --env-file "$AGENT_ENV" --env-file "$AGENT_IMAGE_ENV"
-    -f "$AGENT_REPO/docker-compose.server.yml" -f "$AGENT_COMPOSE_OVERRIDE")
+  args=(-p lubinsun-test --env-file "$AGENT_ENV" --env-file "$AGENT_IMAGE_ENV"
+    --env-file "$AGENT_RUNTIME_ENV" -f "$AGENT_REPO/docker-compose.yml" -f "$AGENT_COMPOSE_OVERRIDE")
   profile=$(env_value "$AGENT_ENV" TOOL_RUNTIME_PROFILE)
   case "${profile:-standard}" in
     standard) ;;
@@ -317,6 +304,36 @@ agent_compose() {
     *) die "不支持的 Agent TOOL_RUNTIME_PROFILE：$profile" ;;
   esac
   docker compose "${args[@]}" "$@"
+}
+
+assert_agent_compose_invariants() {
+  local config bind_host api_port web_port
+  config=$(agent_compose config --format json)
+  bind_host=$(env_value "$AGENT_RUNTIME_ENV" LOCAL_BIND_HOST)
+  api_port=$(env_value "$AGENT_RUNTIME_ENV" BACKEND_PORT)
+  web_port=$(env_value "$AGENT_RUNTIME_ENV" FRONTEND_PORT)
+  if ! jq -e \
+      --arg host "$bind_host" \
+      --arg api_port "$api_port" \
+      --arg web_port "$web_port" \
+      --arg mysql_data "$AGENT_REPO/mysql/data" \
+      --arg skills "$AGENT_REPO/skills" \
+      '
+        (.name == "lubinsun-test") and
+        ((["mysql","tool-executor-local","tool-executor-standard","tool-executor-privileged","backend","frontend"] - (.services | keys)) | length == 0) and
+        (. as $root | [$root.services.mysql,$root.services["tool-executor-local"],$root.services["tool-executor-standard"],$root.services["tool-executor-privileged"],$root.services.backend,$root.services.frontend] | all(.[]; .container_name == null and .network_mode != "host")) and
+        (.services.backend.ports | length == 1) and
+        (.services.frontend.ports | length == 1) and
+        any(.services.backend.ports[]?; .target == 8080 and .published == $api_port and .host_ip == $host) and
+        any(.services.frontend.ports[]?; .target == 80 and .published == $web_port and .host_ip == $host) and
+        any(.services.mysql.volumes[]?; .type == "bind" and .source == $mysql_data and .target == "/var/lib/mysql") and
+        any(.services.backend.volumes[]?; .type == "volume" and .source == "agent-data" and .target == "/var/lib/lubinsun-agent") and
+        any(.services.backend.volumes[]?; .type == "bind" and .source == $skills and .target == "/app/skills" and .read_only == true) and
+        (.volumes["agent-data"].name == "lubinsun-test_agent-data") and
+        (.volumes["agent-data"].external == true)
+      ' <<<"$config" >/dev/null; then
+    die "Agent Compose 违反单实例不变量，拒绝部署"
+  fi
 }
 
 analyzer_compose() {
@@ -395,7 +412,7 @@ verify_zenvis_stack() {
 
 agent_health_host() {
   local host
-  host=$(env_value "$AGENT_ENV" LOCAL_BIND_HOST)
+  host=$(env_value "$AGENT_RUNTIME_ENV" LOCAL_BIND_HOST)
   case "${host:-127.0.0.1}" in
     0.0.0.0) printf '127.0.0.1' ;;
     *) printf '%s' "$host" ;;
@@ -408,8 +425,8 @@ verify_agent_stack() {
     wait_service agent "$service" || { agent_compose ps -a; return 1; }
   done
   host=$(agent_health_host)
-  api_port=$(env_value "$AGENT_ENV" BACKEND_PORT); api_port=${api_port:-18000}
-  web_port=$(env_value "$AGENT_ENV" FRONTEND_PORT); web_port=${web_port:-17000}
+  api_port=$(env_value "$AGENT_RUNTIME_ENV" BACKEND_PORT)
+  web_port=$(env_value "$AGENT_RUNTIME_ENV" FRONTEND_PORT)
   wait_http "http://${host}:${api_port}/api/healthz" 'Lubinsun Agent API' \
     && wait_http "http://${host}:${web_port}/" 'Lubinsun Agent Web'
 }
@@ -511,7 +528,13 @@ create_agent_backup() {
     'exec mysqldump --single-transaction --routines --events --triggers --no-tablespaces -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' \
     | gzip >"$backup_dir/mysql.sql.gz"
   gzip -t "$backup_dir/mysql.sql.gz"
-  sha256sum "$backup_dir/mysql.sql.gz" >"$backup_dir/SHA256SUMS"
+  cp "$AGENT_IMAGE_ENV" "$backup_dir/images.before"
+  cp "$AGENT_RUNTIME_ENV" "$backup_dir/runtime.before"
+  agent_compose config --no-interpolate >"$backup_dir/compose-config.yml"
+  docker inspect lubinsun-test-mysql-1 lubinsun-test-tool-executor-local-1 lubinsun-test-tool-executor-standard-1 lubinsun-test-tool-executor-privileged-1 lubinsun-test-backend-1 lubinsun-test-frontend-1 \
+    | jq '[.[] | {Name,Image,Config:{Image:.Config.Image,Labels:.Config.Labels,User:.Config.User},HostConfig:{NetworkMode,PortBindings,RestartPolicy},Mounts}]' >"$backup_dir/containers.before.json"
+  sha256sum "$backup_dir/mysql.sql.gz" "$backup_dir/images.before" "$backup_dir/runtime.before" \
+    "$backup_dir/compose-config.yml" "$backup_dir/containers.before.json" >"$backup_dir/SHA256SUMS"
   chmod -R go-rwx "$backup_dir"
   CREATED_BACKUP_ID="$backup_id"
 }
@@ -790,12 +813,12 @@ deploy_zenvis_analyzer() {
   [[ -n "$old_image" ]] || die "无法识别现有 Analyzer 镜像"
   create_analyzer_backup
   backup_id="$CREATED_BACKUP_ID"
-  install -m 0600 "$ANALYZER_REPO/configs/zones.json" "$ANALYZER_ZONE_FILE"
+  install -m 0644 "$ANALYZER_REPO/configs/zones.json" "$ANALYZER_ZONE_FILE"
   set_env_key "$ANALYZER_IMAGE_ENV" ANALYZER_IMAGE "$image"
   if ! analyzer_compose config --quiet \
       || ! analyzer_compose up -d --no-deps zenvis-service-analyzer \
       || ! verify_analyzer_stack; then
-    install -m 0600 "$STATE_ROOT/backups/analyzer/$backup_id/zones.json.before" "$ANALYZER_ZONE_FILE"
+    install -m 0644 "$STATE_ROOT/backups/analyzer/$backup_id/zones.json.before" "$ANALYZER_ZONE_FILE"
     set_env_key "$ANALYZER_IMAGE_ENV" ANALYZER_IMAGE "$old_image"
     analyzer_compose up -d --no-deps zenvis-service-analyzer || true
     verify_analyzer_stack || true
@@ -906,6 +929,7 @@ deploy_agent() {
   local sha=$1 repository=$2 backend_image frontend_image old_backend old_frontend backup_id
   backend_image="lubinsun/lubinsun-agent-backend:$sha"
   ensure_agent_runtime
+  assert_agent_compose_invariants
   frontend_image="lubinsun/lubinsun-agent-frontend:$sha"
   docker build --label "org.opencontainers.image.revision=$sha" -f "$AGENT_REPO/deploy/backend.Dockerfile" \
     -t "$backend_image" "$AGENT_REPO"
@@ -985,13 +1009,14 @@ rollback_locked() {
       analyzer_backup="$STATE_ROOT/backups/analyzer/$backup_id"
       [[ -f "$analyzer_backup/SHA256SUMS" ]] || die "Analyzer 配置备份不存在"
       sha256sum -c "$analyzer_backup/SHA256SUMS" >/dev/null
-      install -m 0600 "$analyzer_backup/zones.json.before" "$ANALYZER_ZONE_FILE"
+      install -m 0644 "$analyzer_backup/zones.json.before" "$ANALYZER_ZONE_FILE"
       set_env_key "$ANALYZER_IMAGE_ENV" ANALYZER_IMAGE "$rollback_image_a"
       analyzer_compose up -d --no-deps zenvis-service-analyzer
       verify_analyzer_stack
       ;;
     lubinsun-agent)
       [[ -n "$rollback_image_a" && -n "$rollback_image_b" ]] || die "当前发布缺少 Agent 回滚镜像"
+      assert_agent_compose_invariants
       set_env_key "$AGENT_IMAGE_ENV" BACKEND_IMAGE "$rollback_image_a"
       set_env_key "$AGENT_IMAGE_ENV" FRONTEND_IMAGE "$rollback_image_b"
       agent_compose up -d --no-build mysql tool-executor-local tool-executor-standard tool-executor-privileged backend frontend

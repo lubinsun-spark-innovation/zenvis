@@ -20,15 +20,11 @@ component=${argv[2]}
 repository=${argv[3]}
 sha=${argv[4]}
 case "$component" in
-  zenvis) expected_repository=lubinsun-spark-innovation/zenvis ;;
   zenvis-backend) expected_repository=lubinsun-spark-innovation/zenvis-backend ;;
   zenvis-frontend) expected_repository=lubinsun-spark-innovation/zenvis-frontend ;;
   zenvis-analyzer) expected_repository=lubinsun-spark-innovation/zenvis-service-analyzer ;;
-  plugin-onesoc) expected_repository=lubinsun-spark-innovation/zenvis-plugin-onesoc ;;
-  plugin-lubinsun) expected_repository=lubinsun-spark-innovation/zenvis-plugin-lubinsun ;;
-  lubinsun-agent) expected_repository=lubinsun-spark-innovation/lubinsun_agent ;;
   *)
-    printf '拒绝：未知组件\n' >&2
+    printf '拒绝：该密钥只允许 ZenVis frontend、backend 和 analyzer 自动部署\n' >&2
     exit 64
     ;;
 esac
