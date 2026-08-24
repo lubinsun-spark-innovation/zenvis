@@ -1,0 +1,809 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+WORKSPACE_ROOT=${LUBINSUN_WORKSPACE_ROOT:-/home/lubinsun/lubinsun}
+STATE_ROOT=${LUBINSUN_DEPLOY_STATE_ROOT:-/home/lubinsun/.local/state/lubinsun-deploy}
+LOCK_FILE="$STATE_ROOT/deploy.lock"
+ZENVIS_REPO="$WORKSPACE_ROOT/zenvis"
+ZENVIS_ENV="$ZENVIS_REPO/deploy/.env"
+ZENVIS_IMAGE_ENV="$STATE_ROOT/shared/zenvis-images.env"
+ZENVIS_RELEASE_HEAD="$STATE_ROOT/shared/zenvis-release-head.env"
+AGENT_REPO="$WORKSPACE_ROOT/lubinsun_agent"
+AGENT_ENV="$AGENT_REPO/.env.local.docker"
+AGENT_IMAGE_ENV="$STATE_ROOT/shared/agent-images.env"
+AGENT_COMPOSE_OVERRIDE="$STATE_ROOT/shared/agent-compose.override.yml"
+MIN_MEMORY_KIB=${LUBINSUN_MIN_MEMORY_KIB:-14680064}
+MIN_SWAP_KIB=${LUBINSUN_MIN_SWAP_KIB:-2097152}
+MIN_DISK_KIB=${LUBINSUN_MIN_DISK_KIB:-20971520}
+HEALTH_ATTEMPTS=${LUBINSUN_HEALTH_ATTEMPTS:-90}
+MAVEN_BUILDER_IMAGE=${LUBINSUN_MAVEN_BUILDER_IMAGE:-maven:3.9.11-eclipse-temurin-17}
+NODE_BUILDER_IMAGE=${LUBINSUN_NODE_BUILDER_IMAGE:-node:22-bookworm}
+
+log() {
+  printf '[%s] %s\n' "$(date -Is)" "$*"
+}
+
+die() {
+  log "错误：$*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
+}
+
+usage() {
+  cat <<'USAGE'
+Lubinsun 统一部署控制器
+
+用法：
+  lubinsun-deploy doctor
+  lubinsun-deploy status
+  lubinsun-deploy deploy <component> <owner/repository> <40位git-sha>
+  lubinsun-deploy rollback <component>
+
+component:
+  zenvis | zenvis-backend | zenvis-frontend
+  plugin-lubinsun | plugin-onesoc | lubinsun-agent
+USAGE
+}
+
+env_value() {
+  local file=$1 key=$2 line value
+  [[ -f "$file" ]] || return 0
+  line=$(grep -E "^[[:space:]]*${key}=" "$file" | tail -n 1 || true)
+  [[ -n "$line" ]] || return 0
+  value=${line#*=}
+  value=${value%$'\r'}
+  if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+    value=${value:1:${#value}-2}
+  elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+    value=${value:1:${#value}-2}
+  fi
+  printf '%s' "$value"
+}
+
+manifest_value() {
+  local file=$1 key=$2
+  [[ -f "$file" ]] || return 0
+  sed -n "s/^${key}=//p" "$file" | tail -n 1
+}
+
+component_config() {
+  local component=$1
+  case "$component" in
+    zenvis)
+      COMPONENT_REPO="$ZENVIS_REPO"
+      COMPONENT_GITHUB="lubinsun-spark-innovation/zenvis"
+      ;;
+    zenvis-backend)
+      COMPONENT_REPO="$WORKSPACE_ROOT/zenvis-backend"
+      COMPONENT_GITHUB="lubinsun-spark-innovation/zenvis-backend"
+      ;;
+    zenvis-frontend)
+      COMPONENT_REPO="$WORKSPACE_ROOT/zenvis-frontend"
+      COMPONENT_GITHUB="lubinsun-spark-innovation/zenvis-frontend"
+      ;;
+    plugin-onesoc)
+      COMPONENT_REPO="$WORKSPACE_ROOT/zenvis-plugin/zenvis-plugin-onesoc"
+      COMPONENT_GITHUB="lubinsun-spark-innovation/zenvis-plugin-onesoc"
+      PLUGIN_PACKAGE="com.coolxer.plugin.onesoc"
+      PLUGIN_DIRECTORY="plugin-onesoc"
+      PLUGIN_SMOKE_PATH="/api/v1/plugin/com.coolxer.plugin.onesoc/security-operation/dashboard/overview"
+      ;;
+    plugin-lubinsun)
+      COMPONENT_REPO="$WORKSPACE_ROOT/zenvis-plugin/zenvis-plugin-lubinsun"
+      COMPONENT_GITHUB="lubinsun-spark-innovation/zenvis-plugin-lubinsun"
+      PLUGIN_PACKAGE="com.coolxer.plugin.lubinsun"
+      PLUGIN_DIRECTORY="plugin-lubinsun"
+      PLUGIN_SMOKE_PATH="/api/v1/plugin/com.coolxer.plugin.lubinsun/connection"
+      ;;
+    lubinsun-agent)
+      COMPONENT_REPO="$AGENT_REPO"
+      COMPONENT_GITHUB="lubinsun-spark-innovation/lubinsun_agent"
+      ;;
+    *) die "未知 component：$component" ;;
+  esac
+}
+
+check_env_file() {
+  local file=$1 label=$2 mode
+  [[ -f "$file" ]] || die "$label 环境文件不存在：$file"
+  mode=$(stat -c '%a' "$file")
+  [[ "$mode" == 600 || "$mode" == 400 ]] || die "$label 环境文件权限必须是 600 或 400，当前为 $mode"
+  if grep -Eiq '(^|=)(replace-with-|change-me|REPLACE_ME|CHANGEME)' "$file"; then
+    die "$label 环境文件仍含模板占位值"
+  fi
+}
+
+doctor() {
+  local memory_kib swap_kib disk_kib arch ntp
+  for command in git docker curl jq flock tar gzip sha256sum awk sed df stat sort head find id install mktemp; do need "$command"; done
+  docker info >/dev/null
+  docker compose version >/dev/null
+  arch=$(uname -m)
+  [[ "$arch" == x86_64 || "$arch" == amd64 ]] || die "只支持 x86_64/amd64，当前为 $arch"
+  memory_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+  swap_kib=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+  disk_kib=$(df -Pk "$WORKSPACE_ROOT" | awk 'NR==2 {print $4}')
+  (( memory_kib >= MIN_MEMORY_KIB )) || die "内存不足：${memory_kib}KiB < ${MIN_MEMORY_KIB}KiB"
+  (( swap_kib >= MIN_SWAP_KIB )) || die "Swap 不足：${swap_kib}KiB < ${MIN_SWAP_KIB}KiB"
+  (( disk_kib >= MIN_DISK_KIB )) || die "磁盘可用空间不足：${disk_kib}KiB < ${MIN_DISK_KIB}KiB"
+  if command -v timedatectl >/dev/null 2>&1; then
+    ntp=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)
+    [[ "$ntp" == yes ]] || die "系统时间未与 NTP 同步"
+  fi
+  check_env_file "$ZENVIS_ENV" ZenVis
+  check_env_file "$AGENT_ENV" Lubinsun-Agent
+  [[ -w "$STATE_ROOT" || ( ! -e "$STATE_ROOT" && -w "$(dirname "$STATE_ROOT")" ) ]] \
+    || die "部署状态目录不可写：$STATE_ROOT"
+  log "环境检查通过：arch=$arch memory=${memory_kib}KiB swap=${swap_kib}KiB disk=${disk_kib}KiB"
+}
+
+assert_clean_repo() {
+  local repo=$1
+  git -C "$repo" diff --quiet || die "仓库有未提交的已跟踪改动：$repo"
+  git -C "$repo" diff --cached --quiet || die "仓库有已暂存改动：$repo"
+  [[ -z "$(git -C "$repo" ls-files --others --exclude-standard)" ]] \
+    || die "仓库有未跟踪文件：$repo"
+}
+
+sync_repo() {
+  local repo=$1 expected_repo=$2 expected_sha=$3 remote_url remote_sha
+  [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || die "非法 git SHA：$expected_sha"
+  [[ "$repo" == "$WORKSPACE_ROOT"/* ]] || die "仓库路径越界：$repo"
+  [[ -d "$repo/.git" ]] || die "不是 Git 仓库：$repo"
+  assert_clean_repo "$repo"
+  remote_url=$(git -C "$repo" remote get-url origin)
+  [[ "$remote_url" == *"github.com/${expected_repo}.git" || "$remote_url" == *"github.com:${expected_repo}.git" ]] \
+    || die "origin 与允许仓库不一致：$repo"
+  git -C "$repo" fetch origin main --prune --tags
+  remote_sha=$(git -C "$repo" rev-parse origin/main)
+  if [[ "$expected_sha" != "$remote_sha" ]]; then
+    if git -C "$repo" merge-base --is-ancestor "$expected_sha" "$remote_sha"; then
+      log "事件 $expected_sha 已被更新的 main $remote_sha 取代，本次安全跳过"
+      return 20
+    fi
+    die "事件 SHA 不属于当前 origin/main：expected=$expected_sha remote=$remote_sha"
+  fi
+  git -C "$repo" switch main
+  git -C "$repo" merge --ff-only origin/main
+  [[ "$(git -C "$repo" rev-parse HEAD)" == "$expected_sha" ]] || die "本地 HEAD 与目标 SHA 不一致"
+}
+
+ensure_state() {
+  mkdir -p "$STATE_ROOT/shared" "$STATE_ROOT/components" "$STATE_ROOT/backups/zenvis" "$STATE_ROOT/backups/agent"
+  chmod 700 "$STATE_ROOT" "$STATE_ROOT/shared" "$STATE_ROOT/components" "$STATE_ROOT/backups" \
+    "$STATE_ROOT/backups/zenvis" "$STATE_ROOT/backups/agent"
+}
+
+ensure_agent_runtime() {
+  local backend_image frontend_image
+  if [[ ! -f "$AGENT_IMAGE_ENV" ]]; then
+    backend_image=$(docker inspect --format '{{.Config.Image}}' lubinsun-test-backend-1 2>/dev/null || true)
+    frontend_image=$(docker inspect --format '{{.Config.Image}}' lubinsun-test-frontend-1 2>/dev/null || true)
+    [[ -n "$backend_image" && -n "$frontend_image" ]] || die "无法从现有 Agent 容器初始化镜像状态"
+    {
+      printf 'BACKEND_IMAGE=%s\n' "$backend_image"
+      printf 'FRONTEND_IMAGE=%s\n' "$frontend_image"
+    } >"$AGENT_IMAGE_ENV"
+    chmod 600 "$AGENT_IMAGE_ENV"
+  fi
+  if [[ ! -f "$AGENT_COMPOSE_OVERRIDE" ]]; then
+    cat >"$AGENT_COMPOSE_OVERRIDE" <<YAML
+services:
+  mysql:
+    volumes: !override
+      - $AGENT_REPO/mysql/data:/var/lib/mysql
+      - $AGENT_REPO/mysql/backups:/backups
+  tool-executor-local:
+    volumes: !override
+      - agent-data:/var/lib/lubinsun-agent
+      - tool-executor-local-socket:/run/lubinsun-executor-local
+  tool-executor-standard:
+    volumes: !override
+      - agent-data:/var/lib/lubinsun-agent
+      - tool-executor-standard-socket:/run/lubinsun-executor-standard
+  tool-executor-privileged:
+    volumes: !override
+      - agent-data:/var/lib/lubinsun-agent
+      - tool-executor-privileged-socket:/run/lubinsun-executor-privileged
+  backend:
+    volumes: !override
+      - agent-data:/var/lib/lubinsun-agent
+      - tool-executor-local-socket:/run/lubinsun-executor-local
+      - tool-executor-standard-socket:/run/lubinsun-executor-standard
+      - tool-executor-privileged-socket:/run/lubinsun-executor-privileged
+volumes:
+  agent-data:
+    external: true
+    name: lubinsun-test_agent-data
+YAML
+    chmod 600 "$AGENT_COMPOSE_OVERRIDE"
+  fi
+}
+
+ensure_zenvis_images() {
+  local backend_image frontend_image
+  [[ -f "$ZENVIS_IMAGE_ENV" ]] && return
+  backend_image=$(docker inspect --format '{{.Config.Image}}' zenvis-backend 2>/dev/null || true)
+  frontend_image=$(docker inspect --format '{{.Config.Image}}' zenvis-frontend 2>/dev/null || true)
+  [[ -n "$backend_image" && -n "$frontend_image" ]] || die "无法从现有 ZenVis 容器初始化镜像状态"
+  {
+    printf 'ZENVIS_BACKEND_IMAGE=%s\n' "$backend_image"
+    printf 'ZENVIS_FRONTEND_IMAGE=%s\n' "$frontend_image"
+  } >"$ZENVIS_IMAGE_ENV"
+  chmod 600 "$ZENVIS_IMAGE_ENV"
+}
+
+zenvis_compose() {
+  ensure_zenvis_images
+  docker compose -p zenvis --env-file "$ZENVIS_ENV" --env-file "$ZENVIS_IMAGE_ENV" \
+    -f "$ZENVIS_REPO/deploy/docker-compose.yml" \
+    -f "$ZENVIS_REPO/deploy/docker-compose.automation.yml" "$@"
+}
+
+agent_compose() {
+  local profile bind_host api_port web_port args
+  ensure_agent_runtime
+  bind_host=$(env_value "$AGENT_ENV" LOCAL_BIND_HOST); bind_host=${bind_host:-127.0.0.1}
+  api_port=$(env_value "$AGENT_ENV" BACKEND_PORT); api_port=${api_port:-18000}
+  web_port=$(env_value "$AGENT_ENV" FRONTEND_PORT); web_port=${web_port:-17000}
+  export API_BIND_HOST="$bind_host" API_PORT="$api_port" WEB_PORT="$web_port"
+  args=(-p lubinsun-test --profile web --env-file "$AGENT_ENV" --env-file "$AGENT_IMAGE_ENV"
+    -f "$AGENT_REPO/docker-compose.server.yml" -f "$AGENT_COMPOSE_OVERRIDE")
+  profile=$(env_value "$AGENT_ENV" TOOL_RUNTIME_PROFILE)
+  case "${profile:-standard}" in
+    standard) ;;
+    root) args+=(-f "$AGENT_REPO/docker-compose.tools-root.yml") ;;
+    diagnostic) args+=(-f "$AGENT_REPO/docker-compose.tools-diagnostic.yml") ;;
+    *) die "不支持的 Agent TOOL_RUNTIME_PROFILE：$profile" ;;
+  esac
+  docker compose "${args[@]}" "$@"
+}
+
+set_env_key() {
+  local file=$1 key=$2 value=$3 temp
+  [[ "$value" =~ ^[A-Za-z0-9_./:@+-]+$ ]] || die "环境状态值含非法字符：$key"
+  temp=$(mktemp "${file}.XXXXXX")
+  if [[ -f "$file" ]]; then
+    awk -v key="$key" -v value="$value" '
+      BEGIN { found=0 }
+      $0 ~ "^" key "=" { print key "=" value; found=1; next }
+      { print }
+      END { if (!found) print key "=" value }
+    ' "$file" >"$temp"
+  else
+    printf '%s=%s\n' "$key" "$value" >"$temp"
+  fi
+  chmod 600 "$temp"
+  mv "$temp" "$file"
+}
+verify_image_revision() {
+  local image=$1 expected_sha=$2 actual_sha
+  actual_sha=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$image")
+  [[ "$actual_sha" == "$expected_sha" ]] \
+    || die "镜像版本标签不一致：image=$image expected=$expected_sha actual=$actual_sha"
+}
+
+wait_http() {
+  local url=$1 label=$2
+  for ((attempt=1; attempt<=HEALTH_ATTEMPTS; attempt++)); do
+    if curl -fsS --connect-timeout 3 --max-time 10 "$url" >/dev/null; then
+      log "$label 健康检查通过：$url"
+      return 0
+    fi
+    sleep 2
+  done
+  log "$label 健康检查失败：$url" >&2
+  return 1
+}
+
+wait_service() {
+  local stack=$1 service=$2 container state health
+  for ((attempt=1; attempt<=HEALTH_ATTEMPTS; attempt++)); do
+    if [[ "$stack" == zenvis ]]; then
+      container=$(zenvis_compose ps -q "$service" 2>/dev/null | sed -n '1p')
+    else
+      container=$(agent_compose ps -q "$service" 2>/dev/null | sed -n '1p')
+    fi
+    if [[ -n "$container" ]]; then
+      state=$(docker inspect --format '{{.State.Status}}' "$container" 2>/dev/null || true)
+      health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container" 2>/dev/null || true)
+      [[ "$state" == running && ( "$health" == healthy || "$health" == none ) ]] && return 0
+      [[ "$state" == exited || "$state" == dead ]] && return 1
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+verify_zenvis_stack() {
+  local service
+  for service in kafka-service clickhouse-service vectum-service redis-service redis-stack-service mysql-service zenvis-backend zenvis-frontend; do
+    wait_service zenvis "$service" || { zenvis_compose ps -a; return 1; }
+  done
+  wait_http http://127.0.0.1:11000/ 'ZenVis Web' \
+    && wait_http http://127.0.0.1:11001/ 'ZenVis API' \
+    && wait_http http://127.0.0.1:11002/ 'Vectum'
+}
+
+agent_health_host() {
+  local host
+  host=$(env_value "$AGENT_ENV" LOCAL_BIND_HOST)
+  case "${host:-127.0.0.1}" in
+    0.0.0.0) printf '127.0.0.1' ;;
+    *) printf '%s' "$host" ;;
+  esac
+}
+
+verify_agent_stack() {
+  local service host api_port web_port
+  for service in mysql tool-executor-local tool-executor-standard tool-executor-privileged backend frontend; do
+    wait_service agent "$service" || { agent_compose ps -a; return 1; }
+  done
+  host=$(agent_health_host)
+  api_port=$(env_value "$AGENT_ENV" BACKEND_PORT); api_port=${api_port:-18000}
+  web_port=$(env_value "$AGENT_ENV" FRONTEND_PORT); web_port=${web_port:-17000}
+  wait_http "http://${host}:${api_port}/api/healthz" 'Lubinsun Agent API' \
+    && wait_http "http://${host}:${web_port}/" 'Lubinsun Agent Web'
+}
+
+create_zenvis_backup() {
+  local backup_id backup_dir running
+  backup_id="compose-$(date '+%Y%m%d-%H%M%S')"
+  backup_dir="$STATE_ROOT/backups/zenvis/$backup_id"
+  mkdir -p "$backup_dir"
+  running=$(zenvis_compose ps --services --filter status=running || true)
+  printf '%s\n' "$running" >"$backup_dir/running-services.txt"
+  zenvis_compose config >"$backup_dir/compose-config.yml"
+  cp "$ZENVIS_ENV" "$backup_dir/env.before"
+  cp "$ZENVIS_IMAGE_ENV" "$backup_dir/images.before"
+  log "停止 ZenVis 服务并创建一致性备份：$backup_id"
+  zenvis_compose stop
+  if ! tar -czf "$backup_dir/payload.tar.gz" -C "$ZENVIS_REPO/deploy" \
+      .env docker-compose.yml docker-compose.automation.yml config open_config data; then
+    [[ -n "$running" ]] && zenvis_compose up -d $running || true
+    die "ZenVis 备份失败"
+  fi
+  sha256sum "$backup_dir/payload.tar.gz" >"$backup_dir/SHA256SUMS"
+  [[ -n "$running" ]] && zenvis_compose up -d $running
+  verify_zenvis_stack || die "ZenVis 备份后未能恢复服务"
+  chmod -R go-rwx "$backup_dir"
+  CREATED_BACKUP_ID="$backup_id"
+}
+
+restore_zenvis_backup() {
+  local backup_id=$1 backup_dir safety
+  [[ "$backup_id" =~ ^compose-[0-9]{8}-[0-9]{6}$ ]] || die "非法备份 ID：$backup_id"
+  backup_dir="$STATE_ROOT/backups/zenvis/$backup_id"
+  [[ -f "$backup_dir/payload.tar.gz" ]] || die "ZenVis 备份不存在：$backup_id"
+  (cd "$backup_dir" && sha256sum -c SHA256SUMS)
+  zenvis_compose stop || true
+  safety="$STATE_ROOT/backups/zenvis/rollback-safety-$(date '+%Y%m%d-%H%M%S')"
+  mkdir -p "$safety"
+  for path in data open_config config .env docker-compose.yml docker-compose.automation.yml; do
+    [[ -e "$ZENVIS_REPO/deploy/$path" ]] && mv "$ZENVIS_REPO/deploy/$path" "$safety/"
+  done
+  tar -xzf "$backup_dir/payload.tar.gz" -C "$ZENVIS_REPO/deploy"
+  cp "$backup_dir/images.before" "$ZENVIS_IMAGE_ENV"
+  chmod 600 "$ZENVIS_ENV" "$ZENVIS_IMAGE_ENV"
+  zenvis_compose config --quiet
+  zenvis_compose up -d
+  verify_zenvis_stack || die "ZenVis 备份恢复后健康检查失败"
+  log "已恢复 ZenVis 备份 $backup_id；回滚前文件位于 $safety"
+}
+
+create_agent_backup() {
+  local backup_id backup_dir mysql_id
+  backup_id="agent-$(date '+%Y%m%d-%H%M%S')"
+  backup_dir="$STATE_ROOT/backups/agent/$backup_id"
+  mkdir -p "$backup_dir"
+  mysql_id=$(agent_compose ps -q mysql)
+  [[ -n "$mysql_id" ]] || die "Agent MySQL 未运行"
+  docker exec "$mysql_id" sh -c \
+    'exec mysqldump --single-transaction --routines --events --triggers --no-tablespaces -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' \
+    | gzip >"$backup_dir/mysql.sql.gz"
+  gzip -t "$backup_dir/mysql.sql.gz"
+  sha256sum "$backup_dir/mysql.sql.gz" >"$backup_dir/SHA256SUMS"
+  chmod -R go-rwx "$backup_dir"
+  CREATED_BACKUP_ID="$backup_id"
+}
+
+write_manifest() {
+  local component=$1 sha=$2 repository=$3 image_a=${4:-} image_b=${5:-} backup_id=${6:-}
+  local rollback_image_a=${7:-} rollback_image_b=${8:-}
+  local dir current previous temp
+  dir="$STATE_ROOT/components/$component"
+  current="$dir/current.env"
+  previous="$dir/previous.env"
+  mkdir -p "$dir/releases"
+  [[ -f "$current" ]] && cp "$current" "$previous"
+  temp=$(mktemp "$dir/releases/${sha}.XXXXXX")
+  {
+    printf 'component=%s\n' "$component"
+    printf 'repository=%s\n' "$repository"
+    printf 'sha=%s\n' "$sha"
+    printf 'image_a=%s\n' "$image_a"
+    printf 'image_b=%s\n' "$image_b"
+    printf 'backup_id=%s\n' "$backup_id"
+    printf 'rollback_image_a=%s\n' "$rollback_image_a"
+    printf 'rollback_image_b=%s\n' "$rollback_image_b"
+    printf 'deployed_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } >"$temp"
+  chmod 600 "$temp"
+  mv "$temp" "$dir/releases/$sha.env"
+  cp "$dir/releases/$sha.env" "$current"
+}
+record_zenvis_head() {
+  local component=$1 sha=$2 temp
+  temp=$(mktemp "${ZENVIS_RELEASE_HEAD}.XXXXXX")
+  {
+    printf 'component=%s\n' "$component"
+    printf 'sha=%s\n' "$sha"
+    printf 'updated_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } >"$temp"
+  chmod 600 "$temp"
+  mv "$temp" "$ZENVIS_RELEASE_HEAD"
+}
+
+assert_latest_zenvis_release() {
+  local component=$1 sha=$2 head_component head_sha
+  head_component=$(manifest_value "$ZENVIS_RELEASE_HEAD" component)
+  head_sha=$(manifest_value "$ZENVIS_RELEASE_HEAD" sha)
+  [[ "$head_component" == "$component" && "$head_sha" == "$sha" ]] || {
+    die "拒绝恢复过期的一致性备份：最新 ZenVis 变更是 ${head_component:-unknown}@${head_sha:-unknown}"
+  }
+}
+
+
+run_maven_builder() {
+  local workdir=$1
+  shift
+  local cache="$STATE_ROOT/cache/maven"
+  mkdir -p "$cache"
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp/maven-home \
+    -e MAVEN_CONFIG=/cache \
+    -v "$cache:/cache" \
+    -v "$COMPONENT_REPO:/workspace" \
+    -w "/workspace/$workdir" \
+    "$MAVEN_BUILDER_IMAGE" mvn --batch-mode --no-transfer-progress "$@"
+}
+
+build_zenvis_backend() {
+  local sha=$1 image="lubinsun/zenvis-backend:$sha"
+  run_maven_builder . clean package -DskipTests
+  [[ -s "$COMPONENT_REPO/target/application.jar" ]] || die "Backend 构建产物不存在"
+  docker build \
+    --build-arg BASE_IMAGE_ARCH=amd64 \
+    --label "org.opencontainers.image.revision=$sha" \
+    -t "$image" "$COMPONENT_REPO"
+  verify_image_revision "$image" "$sha"
+  BUILT_IMAGE="$image"
+}
+
+build_zenvis_frontend() {
+  local sha=$1 image="lubinsun/zenvis-frontend:$sha"
+  local cache="$STATE_ROOT/cache/yarn"
+  mkdir -p "$cache"
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp/node-home \
+    -e YARN_CACHE_FOLDER=/cache \
+    -v "$cache:/cache" \
+    -v "$COMPONENT_REPO:/workspace" \
+    -w /workspace \
+    "$NODE_BUILDER_IMAGE" \
+    bash -lc 'corepack yarn install --frozen-lockfile && corepack yarn build:pro'
+  [[ -s "$COMPONENT_REPO/dist/index.html" ]] || die "Frontend 构建产物不存在"
+  docker build \
+    --build-arg BASE_IMAGE_ARCH=amd64 \
+    --label "org.opencontainers.image.revision=$sha" \
+    -t "$image" "$COMPONENT_REPO"
+  BUILT_IMAGE="$image"
+  verify_image_revision "$image" "$sha"
+}
+
+build_plugin() {
+  local cache="$STATE_ROOT/cache/maven"
+  mkdir -p "$cache"
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp/maven-home \
+    -e MAVEN_CONFIG=/cache \
+    -v "$cache:/cache" \
+    -v "$COMPONENT_REPO:/workspace" \
+    -w /workspace \
+    "$MAVEN_BUILDER_IMAGE" bash ./build.sh
+}
+
+deploy_zenvis() {
+  local sha=$1 repository=$2 backup_id
+  ensure_zenvis_images
+  create_zenvis_backup
+  backup_id="$CREATED_BACKUP_ID"
+  if ! zenvis_compose config --quiet || ! zenvis_compose up -d || ! verify_zenvis_stack; then
+    restore_zenvis_backup "$backup_id"
+    die "ZenVis 编排部署失败，已自动回滚"
+  fi
+  install -m 0755 "$ZENVIS_REPO/deploy/automation/lubinsun-deploy-ssh-entry" \
+    /home/lubinsun/.local/bin/lubinsun-deploy-ssh-entry
+  install -m 0755 "$ZENVIS_REPO/deploy/automation/lubinsun-deploy" /home/lubinsun/.local/bin/lubinsun-deploy
+  write_manifest zenvis "$sha" "$repository" '' '' "$backup_id"
+  record_zenvis_head zenvis "$sha"
+}
+
+deploy_zenvis_backend() {
+  local sha=$1 repository=$2 image old_image backup_id
+  ensure_zenvis_images
+  build_zenvis_backend "$sha"
+  image="$BUILT_IMAGE"
+  old_image=$(env_value "$ZENVIS_IMAGE_ENV" ZENVIS_BACKEND_IMAGE)
+  create_zenvis_backup
+  backup_id="$CREATED_BACKUP_ID"
+  set_env_key "$ZENVIS_IMAGE_ENV" ZENVIS_BACKEND_IMAGE "$image"
+  if ! zenvis_compose config --quiet || ! zenvis_compose up -d --no-deps zenvis-backend \
+      || ! wait_service zenvis zenvis-backend || ! wait_http http://127.0.0.1:11001/ 'ZenVis API'; then
+    set_env_key "$ZENVIS_IMAGE_ENV" ZENVIS_BACKEND_IMAGE "$old_image"
+    zenvis_compose up -d --no-deps zenvis-backend || true
+    restore_zenvis_backup "$backup_id"
+    die "ZenVis Backend 部署失败，已自动回滚"
+  fi
+  write_manifest zenvis-backend "$sha" "$repository" "$image" '' "$backup_id" "$old_image" ''
+  record_zenvis_head zenvis-backend "$sha"
+}
+
+deploy_zenvis_frontend() {
+  local sha=$1 repository=$2 image old_image
+  ensure_zenvis_images
+  build_zenvis_frontend "$sha"
+  image="$BUILT_IMAGE"
+  old_image=$(env_value "$ZENVIS_IMAGE_ENV" ZENVIS_FRONTEND_IMAGE)
+  set_env_key "$ZENVIS_IMAGE_ENV" ZENVIS_FRONTEND_IMAGE "$image"
+  if ! zenvis_compose config --quiet || ! zenvis_compose up -d --no-deps zenvis-frontend \
+      || ! wait_service zenvis zenvis-frontend || ! wait_http http://127.0.0.1:11000/ 'ZenVis Web'; then
+    set_env_key "$ZENVIS_IMAGE_ENV" ZENVIS_FRONTEND_IMAGE "$old_image"
+    zenvis_compose up -d --no-deps zenvis-frontend || true
+    wait_http http://127.0.0.1:11000/ 'ZenVis Web rollback' || true
+    die "ZenVis Frontend 部署失败，已自动回滚"
+  fi
+  write_manifest zenvis-frontend "$sha" "$repository" "$image" '' '' "$old_image" ''
+  record_zenvis_head zenvis-frontend "$sha"
+}
+
+api_token() {
+  local token
+  token=$(env_value "$ZENVIS_ENV" API_BEARER_TOKEN)
+  [[ -n "$token" ]] || die "ZenVis API_BEARER_TOKEN 未配置"
+  printf '%s' "$token"
+}
+
+plugin_request() {
+  local method=$1 path=$2 token=$3 data=${4:-}
+  if [[ -n "$data" ]]; then
+    curl -fsS -X "$method" -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+      --data "$data" "http://127.0.0.1:11001$path"
+  else
+    curl -fsS -X "$method" -H "Authorization: Bearer $token" "http://127.0.0.1:11001$path"
+  fi
+}
+
+wait_plugin_installed() {
+  local id=$1 token=$2 response status
+  for ((attempt=1; attempt<=180; attempt++)); do
+    response=$(plugin_request GET "/api/v1/system/plugin/$id/view" "$token")
+    [[ "$(jq -r '.status' <<<"$response")" == 0 ]] || return 1
+    status=$(jq -r '.data.status' <<<"$response")
+    case "$status" in
+      INSTALLED) return 0 ;;
+      INSTALL_FAILED|UPGRADE_FAILED|UNINSTALL_FAILED) return 1 ;;
+    esac
+    sleep 2
+  done
+  return 1
+}
+
+deploy_plugin() {
+  local component=$1 sha=$2 repository=$3 token package_file package_version package_digest backup_id
+  local list_response plugin_id current_version upload_response candidate_path request response
+  build_plugin
+  package_file="$COMPONENT_REPO/${PLUGIN_PACKAGE//./-}.tar.gz"
+  [[ -f "$package_file" ]] || die "插件包不存在：$package_file"
+  package_version=$(jq -r '.version' "$COMPONENT_REPO/$PLUGIN_DIRECTORY/index.json")
+  package_digest=$(sha256sum "$package_file" | awk '{print $1}')
+  token=$(api_token)
+  list_response=$(plugin_request GET '/api/v1/system/plugin/list?page=1&per_page=200' "$token")
+  plugin_id=$(jq -r --arg package "$PLUGIN_PACKAGE" \
+    '.data.rows[]? | select(.package_name == $package) | .id' <<<"$list_response" | head -n 1)
+  [[ "$plugin_id" =~ ^[0-9]+$ ]] || die "未找到已安装插件：$PLUGIN_PACKAGE"
+  current_version=$(jq -r --arg package "$PLUGIN_PACKAGE" \
+    '.data.rows[]? | select(.package_name == $package) | .version' <<<"$list_response" | head -n 1)
+  [[ "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ ]] \
+    || die "当前插件版本格式异常：$current_version"
+  create_zenvis_backup
+  backup_id="$CREATED_BACKUP_ID"
+  upload_response=$(curl -fsS -H "Authorization: Bearer $token" -F "file=@$package_file" \
+    http://127.0.0.1:11001/api/v1/system/plugin/upload)
+  [[ "$(jq -r '.status' <<<"$upload_response")" == 0 ]] || {
+    restore_zenvis_backup "$backup_id"; die "插件上传失败";
+  }
+  candidate_path=$(jq -r '.data.plugin_path' <<<"$upload_response")
+  [[ -n "$candidate_path" && "$candidate_path" != null ]] || {
+    restore_zenvis_backup "$backup_id"; die "插件上传响应缺少 plugin_path";
+  }
+  if [[ "$(printf '%s\n%s\n' "$package_version" "$current_version" | sort -V | tail -n 1)" != "$package_version" \
+      || "$package_version" == "$current_version" ]]; then
+    stage_plugin_version "$plugin_id" "$PLUGIN_PACKAGE" "$current_version" 0.0.0
+    log "通过受控元数据暂存安装原始 main 包：$current_version -> $package_version"
+  fi
+  request=$(jq -cn --arg path "$candidate_path" '{plugin_path:$path}')
+  response=$(plugin_request POST "/api/v1/system/plugin/$plugin_id/upgrade" "$token" "$request")
+  if [[ "$(jq -r '.status' <<<"$response")" != 0 ]] || ! wait_plugin_installed "$plugin_id" "$token"; then
+    plugin_request POST "/api/v1/system/plugin/$plugin_id/upgrade/recover" "$token" >/dev/null || true
+    restore_zenvis_backup "$backup_id"
+    die "插件升级失败，已恢复 ZenVis 一致性备份"
+  fi
+  response=$(plugin_request GET "/api/v1/system/plugin/$plugin_id/view" "$token")
+  [[ "$(jq -r '.data.version' <<<"$response")" == "$package_version" ]] || {
+    restore_zenvis_backup "$backup_id"; die "插件运行版本与包版本不一致";
+  }
+  if ! curl -fsS -H "Authorization: Bearer $token" "http://127.0.0.1:11001$PLUGIN_SMOKE_PATH" >/dev/null; then
+    restore_zenvis_backup "$backup_id"
+    die "插件业务健康检查失败，已恢复 ZenVis 一致性备份"
+  fi
+  write_manifest "$component" "$sha" "$repository" "$PLUGIN_PACKAGE:$package_version" "sha256:$package_digest" "$backup_id"
+  record_zenvis_head "$component" "$sha"
+}
+
+stage_plugin_version() {
+  local plugin_id=$1 package=$2 expected=$3 target=$4 mysql_id sql actual
+  [[ "$plugin_id" =~ ^[0-9]+$ ]] || die "非法插件 ID"
+  [[ "$package" =~ ^[a-z0-9.]+$ ]] || die "非法插件包名"
+  [[ "$expected" =~ ^[A-Za-z0-9.-]+$ && "$target" =~ ^[A-Za-z0-9.-]+$ ]] || die "非法插件版本"
+  mysql_id=$(zenvis_compose ps -q mysql-service)
+  [[ -n "$mysql_id" ]] || die "ZenVis MySQL 未运行"
+  sql="UPDATE t_sys_plugin SET version='$target' WHERE id=$plugin_id AND package_name='$package' AND version='$expected' AND status='INSTALLED';"
+  docker exec "$mysql_id" sh -c 'exec mysql -N -B -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -e "$1"' sh "$sql" >/dev/null
+  sql="SELECT version FROM t_sys_plugin WHERE id=$plugin_id AND package_name='$package';"
+  actual=$(docker exec "$mysql_id" sh -c 'exec mysql -N -B -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -e "$1"' sh "$sql")
+  [[ "$actual" == "$target" ]] || die "插件版本元数据暂存失败"
+}
+
+deploy_agent() {
+  local sha=$1 repository=$2 backend_image frontend_image old_backend old_frontend backup_id
+  backend_image="lubinsun/lubinsun-agent-backend:$sha"
+  ensure_agent_runtime
+  frontend_image="lubinsun/lubinsun-agent-frontend:$sha"
+  docker build --label "org.opencontainers.image.revision=$sha" -f "$AGENT_REPO/deploy/backend.Dockerfile" \
+    -t "$backend_image" "$AGENT_REPO"
+  docker build --label "org.opencontainers.image.revision=$sha" -f "$AGENT_REPO/deploy/frontend.Dockerfile" \
+    -t "$frontend_image" "$AGENT_REPO"
+  verify_image_revision "$backend_image" "$sha"
+  verify_image_revision "$frontend_image" "$sha"
+  old_backend=$(env_value "$AGENT_IMAGE_ENV" BACKEND_IMAGE)
+  old_frontend=$(env_value "$AGENT_IMAGE_ENV" FRONTEND_IMAGE)
+  [[ -n "$old_backend" && -n "$old_frontend" ]] || die "无法识别现有 Agent 镜像"
+  create_agent_backup
+  backup_id="$CREATED_BACKUP_ID"
+  set_env_key "$AGENT_IMAGE_ENV" BACKEND_IMAGE "$backend_image"
+  set_env_key "$AGENT_IMAGE_ENV" FRONTEND_IMAGE "$frontend_image"
+  if ! agent_compose config --quiet || ! agent_compose up -d --no-build \
+      mysql tool-executor-local tool-executor-standard tool-executor-privileged backend frontend \
+      || ! verify_agent_stack; then
+    set_env_key "$AGENT_IMAGE_ENV" BACKEND_IMAGE "$old_backend"
+    set_env_key "$AGENT_IMAGE_ENV" FRONTEND_IMAGE "$old_frontend"
+    agent_compose up -d --no-build mysql tool-executor-local tool-executor-standard tool-executor-privileged backend frontend || true
+    verify_agent_stack || true
+    die "Lubinsun Agent 部署失败，应用镜像已回滚；数据库备份为 $backup_id"
+  fi
+  write_manifest lubinsun-agent "$sha" "$repository" "$backend_image" "$frontend_image" "$backup_id" \
+    "$old_backend" "$old_frontend"
+}
+
+deploy_locked() {
+  local component=$1 repository=$2 sha=$3 sync_status=0
+  component_config "$component"
+  [[ "$repository" == "$COMPONENT_GITHUB" ]] || die "仓库参数与 component 不匹配"
+  doctor
+  sync_repo "$COMPONENT_REPO" "$COMPONENT_GITHUB" "$sha" || sync_status=$?
+  [[ "$sync_status" == 0 ]] || { [[ "$sync_status" == 20 ]] && return 0; return "$sync_status"; }
+  case "$component" in
+    zenvis) deploy_zenvis "$sha" "$repository" ;;
+    zenvis-backend) deploy_zenvis_backend "$sha" "$repository" ;;
+    zenvis-frontend) deploy_zenvis_frontend "$sha" "$repository" ;;
+    plugin-onesoc|plugin-lubinsun) deploy_plugin "$component" "$sha" "$repository" ;;
+    lubinsun-agent) deploy_agent "$sha" "$repository" ;;
+  esac
+  log "部署成功：component=$component sha=$sha"
+}
+
+rollback_locked() {
+  local component=$1 current previous current_sha rollback_image_a rollback_image_b backup_id temp
+  component_config "$component"
+  current="$STATE_ROOT/components/$component/current.env"
+  previous="$STATE_ROOT/components/$component/previous.env"
+  [[ -f "$current" ]] || die "$component 没有可回滚的当前发布"
+  backup_id=$(manifest_value "$current" backup_id)
+  current_sha=$(manifest_value "$current" sha)
+  rollback_image_a=$(manifest_value "$current" rollback_image_a)
+  rollback_image_b=$(manifest_value "$current" rollback_image_b)
+  case "$component" in
+    zenvis|plugin-onesoc|plugin-lubinsun)
+      [[ -n "$backup_id" ]] || die "$component 当前发布没有一致性备份"
+      assert_latest_zenvis_release "$component" "$current_sha"
+      restore_zenvis_backup "$backup_id"
+      ;;
+    zenvis-backend)
+      [[ -n "$rollback_image_a" ]] || die "当前发布缺少 Backend 回滚镜像"
+      set_env_key "$ZENVIS_IMAGE_ENV" ZENVIS_BACKEND_IMAGE "$rollback_image_a"
+      zenvis_compose up -d --no-deps zenvis-backend
+      wait_http http://127.0.0.1:11001/ 'ZenVis API rollback'
+      ;;
+    zenvis-frontend)
+      [[ -n "$rollback_image_a" ]] || die "当前发布缺少 Frontend 回滚镜像"
+      set_env_key "$ZENVIS_IMAGE_ENV" ZENVIS_FRONTEND_IMAGE "$rollback_image_a"
+      zenvis_compose up -d --no-deps zenvis-frontend
+      wait_http http://127.0.0.1:11000/ 'ZenVis Web rollback'
+      ;;
+    lubinsun-agent)
+      [[ -n "$rollback_image_a" && -n "$rollback_image_b" ]] || die "当前发布缺少 Agent 回滚镜像"
+      set_env_key "$AGENT_IMAGE_ENV" BACKEND_IMAGE "$rollback_image_a"
+      set_env_key "$AGENT_IMAGE_ENV" FRONTEND_IMAGE "$rollback_image_b"
+      agent_compose up -d --no-build mysql tool-executor-local tool-executor-standard tool-executor-privileged backend frontend
+      verify_agent_stack
+      ;;
+  esac
+  if [[ "$component" != lubinsun-agent ]]; then
+    record_zenvis_head "rollback-$component" "$current_sha"
+  fi
+  if [[ -f "$previous" ]]; then
+    temp=$(mktemp "$STATE_ROOT/components/$component/swap.XXXXXX")
+    cp "$current" "$temp"
+    cp "$previous" "$current"
+    mv "$temp" "$previous"
+    log "回滚成功：component=$component sha=$(manifest_value "$current" sha)"
+  else
+    mv "$current" "$previous"
+    log "回滚成功：component=$component，已恢复自动化接管前版本"
+  fi
+}
+
+status() {
+  local component current previous
+  for component in zenvis zenvis-backend zenvis-frontend plugin-lubinsun plugin-onesoc lubinsun-agent; do
+    current="$STATE_ROOT/components/$component/current.env"
+    previous="$STATE_ROOT/components/$component/previous.env"
+    printf '%-18s current=%-40s previous=%s\n' "$component" \
+      "$(manifest_value "$current" sha)" "$(manifest_value "$previous" sha)"
+  done
+  zenvis_compose ps -a
+  agent_compose ps -a
+}
+
+main() {
+  local action=${1:-}
+  ensure_state
+  case "$action" in
+    doctor) doctor ;;
+    status) doctor; status ;;
+    deploy)
+      [[ $# -eq 4 ]] || { usage; exit 2; }
+      exec 9>"$LOCK_FILE"
+      flock -w 1800 9 || die "等待跨仓库部署锁超时"
+      deploy_locked "$2" "$3" "$4"
+      ;;
+    rollback)
+      [[ $# -eq 2 ]] || { usage; exit 2; }
+      exec 9>"$LOCK_FILE"
+      flock -w 1800 9 || die "等待跨仓库部署锁超时"
+      doctor
+      rollback_locked "$2"
+      ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

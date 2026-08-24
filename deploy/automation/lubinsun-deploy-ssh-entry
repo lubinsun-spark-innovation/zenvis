@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+DEPLOY_BIN=/home/lubinsun/.local/bin/lubinsun-deploy
+original=${SSH_ORIGINAL_COMMAND:-}
+
+if [[ -z "$original" || "$original" == *$'\n'* || "$original" == *$'\r'* ]]; then
+  printf '拒绝：缺少命令或命令包含换行\n' >&2
+  exit 64
+fi
+
+read -r -a argv <<<"$original"
+if [[ ${#argv[@]} -ne 5 || "${argv[0]}" != "$DEPLOY_BIN" || "${argv[1]}" != deploy ]]; then
+  printf '拒绝：该 SSH key 只能调用统一部署控制器\n' >&2
+  exit 64
+fi
+
+component=${argv[2]}
+repository=${argv[3]}
+sha=${argv[4]}
+case "$component" in
+  zenvis) expected_repository=lubinsun-spark-innovation/zenvis ;;
+  zenvis-backend) expected_repository=lubinsun-spark-innovation/zenvis-backend ;;
+  zenvis-frontend) expected_repository=lubinsun-spark-innovation/zenvis-frontend ;;
+  plugin-onesoc) expected_repository=lubinsun-spark-innovation/zenvis-plugin-onesoc ;;
+  plugin-lubinsun) expected_repository=lubinsun-spark-innovation/zenvis-plugin-lubinsun ;;
+  lubinsun-agent) expected_repository=lubinsun-spark-innovation/lubinsun_agent ;;
+  *)
+    printf '拒绝：未知组件\n' >&2
+    exit 64
+    ;;
+esac
+
+[[ "$repository" == "$expected_repository" ]] || { printf '拒绝：仓库与组件不匹配\n' >&2; exit 64; }
+[[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { printf '拒绝：Git SHA 非法\n' >&2; exit 64; }
+
+exec "$DEPLOY_BIN" deploy "$component" "$repository" "$sha"
