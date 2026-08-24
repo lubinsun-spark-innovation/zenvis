@@ -55,6 +55,8 @@ install -m 0755 deploy/automation/lubinsun-deploy-ssh-entry /home/lubinsun/.loca
 
 所有 Node/Corepack 安装、测试和构建命令都会移除宿主机可能存在的 `NODE_TLS_REJECT_UNAUTHORIZED`，依赖下载必须通过正常 TLS 证书校验；禁止通过关闭 TLS 来绕过 registry 证书或网络问题。
 
+主机的部署 `umask` 保持 `077` 以保护备份、环境文件和清单；只有即将复制进 Nginx 镜像的 `dist` 静态目录会显式归一化为目录 `0755`、文件 `0644`，避免 Nginx 非 root 工作进程返回 403。
+
 本机优先使用 `/home/lubinsun/.local/jvm/temurin-17`、`/home/lubinsun/.local/lib/apache-maven-3.9.11` 与固定的 Node home；它们必须通过 `doctor` 的版本检查，当前 Node `24.15.0` 满足前端 `^20.19.0 || >=22.12.0` 且 Corepack 固定 Yarn `1.22.22`。缺少主机工具链时回退到固定 Maven/Temurin 或 Node 22 Docker 镜像。Java/Maven 来自 Adoptium 与 Apache 官方发行包，并在安装前按官方元数据校验 SHA-256/SHA-512。
 
 运行状态位于 `/home/lubinsun/.local/state/lubinsun-deploy`，权限为当前部署用户私有。不要提交这里的备份、清单或环境文件。

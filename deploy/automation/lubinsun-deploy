@@ -651,6 +651,8 @@ build_zenvis_frontend() {
       bash -lc 'corepack yarn install --frozen-lockfile && corepack yarn test && corepack yarn build:pro-tsc'
   fi
   [[ -s "$COMPONENT_REPO/dist/index.html" ]] || die "Frontend 构建产物不存在"
+  find "$COMPONENT_REPO/dist" -type d -exec chmod 0755 {} +
+  find "$COMPONENT_REPO/dist" -type f -exec chmod 0644 {} +
   docker build \
     --build-arg BASE_IMAGE_ARCH=amd64 \
     --label "org.opencontainers.image.revision=$sha" \
