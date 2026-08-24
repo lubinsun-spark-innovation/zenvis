@@ -26,6 +26,7 @@ MAVEN_BUILDER_IMAGE=${LUBINSUN_MAVEN_BUILDER_IMAGE:-maven:3.9.11-eclipse-temurin
 HOST_MAVEN_BIN=${LUBINSUN_HOST_MAVEN_BIN:-/home/lubinsun/.local/lib/apache-maven-3.9.11/bin/mvn}
 HOST_JAVA_HOME=${LUBINSUN_HOST_JAVA_HOME:-/home/lubinsun/.local/jvm/temurin-17}
 NODE_BUILDER_IMAGE=${LUBINSUN_NODE_BUILDER_IMAGE:-node:22-bookworm}
+HOST_NODE_HOME=${LUBINSUN_HOST_NODE_HOME:-/home/lubinsun/.nvm/versions/node/v24.15.0}
 BACKEND_SAFE_TEST_PATTERN=${LUBINSUN_BACKEND_SAFE_TEST_PATTERN:-*,!McpChatToolGrantPersistenceTest,!ClickhouseTableTtlIntegrationTest,!ClickhouseRecordIdMigrationIntegrationTest,!WebServiceApplicationTests,!MenuTest,!PluginUpgradeUiConfigTest,!SkillServiceTest,!DataInitiatorDashboardTest,!ReportExportServiceTest}
 
 log() {
@@ -141,6 +142,14 @@ doctor() {
       || die "本地主机 Maven 版本必须是 3.9.11"
     "$HOST_JAVA_HOME/bin/java" -version 2>&1 | head -n 1 | grep -Eq '^openjdk version "17\.' \
       || die "本地主机 Java 主版本必须是 17"
+  fi
+  if [[ -e "$HOST_NODE_HOME" ]]; then
+    [[ -x "$HOST_NODE_HOME/bin/node" && -x "$HOST_NODE_HOME/bin/corepack" ]] \
+      || die "本地主机 Node 工具链不完整"
+    "$HOST_NODE_HOME/bin/node" -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a > 22 || a === 22 && b >= 12 || a === 20 && b >= 19 ? 0 : 1)' \
+      || die "本地主机 Node 不满足 ^20.19.0 || >=22.12.0"
+    [[ "$(env -u NODE_TLS_REJECT_UNAUTHORIZED "$HOST_NODE_HOME/bin/corepack" yarn --version)" == 1.22.22 ]] \
+      || die "本地主机 Yarn 版本必须是 1.22.22"
   fi
   arch=$(uname -m)
   [[ "$arch" == x86_64 || "$arch" == amd64 ]] || die "只支持 x86_64/amd64，当前为 $arch"
@@ -614,17 +623,33 @@ build_zenvis_backend() {
 
 build_zenvis_frontend() {
   local sha=$1 image="lubinsun/zenvis-frontend:$sha"
-  local cache="$STATE_ROOT/cache/yarn"
-  mkdir -p "$cache"
-  docker run --rm \
-    --user "$(id -u):$(id -g)" \
-    -e HOME=/tmp/node-home \
-    -e YARN_CACHE_FOLDER=/cache \
-    -v "$cache:/cache" \
-    -v "$COMPONENT_REPO:/workspace" \
-    -w /workspace \
-    "$NODE_BUILDER_IMAGE" \
-    bash -lc 'corepack yarn install --frozen-lockfile && corepack yarn test && corepack yarn build:pro-tsc'
+  local cache="$STATE_ROOT/cache/yarn" build_home="$STATE_ROOT/cache/node-home"
+  local corepack_home="$STATE_ROOT/cache/corepack"
+  mkdir -p "$cache" "$build_home" "$corepack_home"
+  if [[ -x "$HOST_NODE_HOME/bin/node" && -x "$HOST_NODE_HOME/bin/corepack" ]]; then
+    (
+      cd "$COMPONENT_REPO"
+      HOME="$build_home" \
+      COREPACK_HOME="$corepack_home" \
+      YARN_CACHE_FOLDER="$cache" \
+      PATH="$HOST_NODE_HOME/bin:$PATH" \
+        env -u NODE_TLS_REJECT_UNAUTHORIZED "$HOST_NODE_HOME/bin/corepack" yarn install --frozen-lockfile
+      HOME="$build_home" PATH="$HOST_NODE_HOME/bin:$PATH" \
+        env -u NODE_TLS_REJECT_UNAUTHORIZED "$HOST_NODE_HOME/bin/corepack" yarn test
+      HOME="$build_home" PATH="$HOST_NODE_HOME/bin:$PATH" \
+        env -u NODE_TLS_REJECT_UNAUTHORIZED "$HOST_NODE_HOME/bin/corepack" yarn build:pro-tsc
+    )
+  else
+    docker run --rm \
+      --user "$(id -u):$(id -g)" \
+      -e HOME=/tmp/node-home \
+      -e YARN_CACHE_FOLDER=/cache \
+      -v "$cache:/cache" \
+      -v "$COMPONENT_REPO:/workspace" \
+      -w /workspace \
+      "$NODE_BUILDER_IMAGE" \
+      bash -lc 'corepack yarn install --frozen-lockfile && corepack yarn test && corepack yarn build:pro-tsc'
+  fi
   [[ -s "$COMPONENT_REPO/dist/index.html" ]] || die "Frontend 构建产物不存在"
   docker build \
     --build-arg BASE_IMAGE_ARCH=amd64 \
