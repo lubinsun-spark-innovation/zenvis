@@ -415,25 +415,42 @@ verify_analyzer_stack() {
   }
 }
 
+start_saved_containers() {
+  local backup_dir=$1 containers=()
+  [[ -f "$backup_dir/running-containers.tsv" ]] || return 0
+  mapfile -t containers < <(awk -F '\t' 'NF == 2 {print $2}' "$backup_dir/running-containers.tsv")
+  if (( ${#containers[@]} > 0 )); then
+    docker start "${containers[@]}" >/dev/null
+  fi
+}
+
 create_zenvis_backup() {
-  local backup_id backup_dir running
+  local backup_id backup_dir running service container
   backup_id="compose-$(date '+%Y%m%d-%H%M%S')"
   backup_dir="$STATE_ROOT/backups/zenvis/$backup_id"
   mkdir -p "$backup_dir"
   running=$(zenvis_compose ps --services --filter status=running || true)
   printf '%s\n' "$running" >"$backup_dir/running-services.txt"
+  : >"$backup_dir/running-containers.tsv"
+  while IFS= read -r service; do
+    container=$(zenvis_compose ps -q "$service")
+    [[ -n "$container" ]] && printf '%s\t%s\n' "$service" "$container" >>"$backup_dir/running-containers.tsv"
+  done <<<"$running"
   zenvis_compose config >"$backup_dir/compose-config.yml"
   cp "$ZENVIS_ENV" "$backup_dir/env.before"
   cp "$ZENVIS_IMAGE_ENV" "$backup_dir/images.before"
   log "停止 ZenVis 服务并创建一致性备份：$backup_id"
   zenvis_compose stop
-  if ! tar -czf "$backup_dir/payload.tar.gz" -C "$ZENVIS_REPO/deploy" \
-      .env docker-compose.yml docker-compose.automation.yml config open_config data; then
-    [[ -n "$running" ]] && zenvis_compose up -d $running || true
+  if ! docker run --rm -v "$ZENVIS_REPO/deploy:/source:ro" alpine:3.22 \
+      tar -cf - -C /source .env docker-compose.yml docker-compose.automation.yml config open_config data \
+      | gzip >"$backup_dir/payload.tar.gz"; then
+    start_saved_containers "$backup_dir" || true
+    verify_zenvis_stack || true
     die "ZenVis 备份失败"
   fi
+  start_saved_containers "$backup_dir"
+  gzip -t "$backup_dir/payload.tar.gz" || die "ZenVis 备份压缩包校验失败"
   sha256sum "$backup_dir/payload.tar.gz" >"$backup_dir/SHA256SUMS"
-  [[ -n "$running" ]] && zenvis_compose up -d $running
   verify_zenvis_stack || die "ZenVis 备份后未能恢复服务"
   chmod -R go-rwx "$backup_dir"
   CREATED_BACKUP_ID="$backup_id"
@@ -451,7 +468,9 @@ restore_zenvis_backup() {
   for path in data open_config config .env docker-compose.yml docker-compose.automation.yml; do
     [[ -e "$ZENVIS_REPO/deploy/$path" ]] && mv "$ZENVIS_REPO/deploy/$path" "$safety/"
   done
-  tar -xzf "$backup_dir/payload.tar.gz" -C "$ZENVIS_REPO/deploy"
+  gzip -dc "$backup_dir/payload.tar.gz" \
+    | docker run --rm -i -v "$ZENVIS_REPO/deploy:/target" alpine:3.22 \
+      tar -xf - -C /target
   cp "$backup_dir/images.before" "$ZENVIS_IMAGE_ENV"
   chmod 600 "$ZENVIS_ENV" "$ZENVIS_IMAGE_ENV"
   zenvis_compose config --quiet
