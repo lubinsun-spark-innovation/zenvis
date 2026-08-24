@@ -134,7 +134,7 @@ check_env_file() {
 
 doctor() {
   local memory_kib swap_kib disk_kib arch ntp
-  for command in git docker curl jq flock tar gzip sha256sum awk sed df stat sort head find id install mktemp; do need "$command"; done
+  for command in git docker curl jq flock tar gzip sha256sum awk sed cmp df stat sort head find id install mktemp; do need "$command"; done
   docker info >/dev/null
   docker compose version >/dev/null
   if [[ -e "$(dirname "$HOST_MAVEN_BIN")" || -e "$HOST_JAVA_HOME" ]]; then
@@ -212,7 +212,7 @@ ensure_state() {
 }
 
 ensure_analyzer_runtime() {
-  local image
+  local image temp
   if [[ ! -f "$ANALYZER_IMAGE_ENV" ]]; then
     image=$(docker inspect --format '{{.Config.Image}}' zenvis-service-analyzer 2>/dev/null || true)
     [[ -n "$image" ]] || die "无法从现有 Analyzer 容器初始化镜像状态"
@@ -223,15 +223,21 @@ ensure_analyzer_runtime() {
     [[ -f "$ANALYZER_REPO/configs/zones.json" ]] || die "Analyzer 区域配置不存在"
     install -m 0644 "$ANALYZER_REPO/configs/zones.json" "$ANALYZER_ZONE_FILE"
   fi
-  if [[ ! -f "$ANALYZER_COMPOSE_OVERRIDE" ]]; then
-    cat >"$ANALYZER_COMPOSE_OVERRIDE" <<YAML
+  temp=$(mktemp "${ANALYZER_COMPOSE_OVERRIDE}.XXXXXX")
+  cat >"$temp" <<YAML
 services:
   zenvis-service-analyzer:
     image: \${ANALYZER_IMAGE:?ANALYZER_IMAGE is required}
+    ports: !override
+      - "127.0.0.1:\${ANALYZER_HTTP_PORT:-18080}:18080"
     volumes: !override
       - $ANALYZER_ZONE_FILE:/app/configs/zones.json:ro
 YAML
-    chmod 600 "$ANALYZER_COMPOSE_OVERRIDE"
+  chmod 600 "$temp"
+  if [[ -f "$ANALYZER_COMPOSE_OVERRIDE" ]] && cmp -s "$temp" "$ANALYZER_COMPOSE_OVERRIDE"; then
+    rm -f "$temp"
+  else
+    mv "$temp" "$ANALYZER_COMPOSE_OVERRIDE"
   fi
 }
 
@@ -341,6 +347,26 @@ analyzer_compose() {
   docker compose -p deploy --env-file "$ANALYZER_ENV" --env-file "$ANALYZER_IMAGE_ENV" \
     -f "$ANALYZER_REPO/deploy/docker-compose.topology.yml" \
     -f "$ANALYZER_COMPOSE_OVERRIDE" "$@"
+}
+
+assert_analyzer_compose_invariants() {
+  local config published_port
+  config=$(analyzer_compose config --format json)
+  published_port=$(env_value "$ANALYZER_ENV" ANALYZER_HTTP_PORT)
+  published_port=${published_port:-18080}
+  if ! jq -e \
+      --arg published_port "$published_port" \
+      --arg zones "$ANALYZER_ZONE_FILE" \
+      '
+        (.services["zenvis-service-analyzer"].ports | length == 1) and
+        any(.services["zenvis-service-analyzer"].ports[]?;
+          .target == 18080 and .published == $published_port and .host_ip == "127.0.0.1") and
+        any(.services["zenvis-service-analyzer"].volumes[]?;
+          .type == "bind" and .source == $zones and .target == "/app/configs/zones.json" and .read_only == true) and
+        any(.services["zenvis-service-analyzer"].networks | keys[]?; . == "zenvis-network")
+      ' <<<"$config" >/dev/null; then
+    die "Analyzer Compose 违反安全不变量（18080 必须仅绑定 127.0.0.1），拒绝部署"
+  fi
 }
 
 set_env_key() {
@@ -807,6 +833,7 @@ deploy_zenvis_frontend() {
 deploy_zenvis_analyzer() {
   local sha=$1 repository=$2 image old_image backup_id
   ensure_analyzer_runtime
+  assert_analyzer_compose_invariants
   build_zenvis_analyzer "$sha"
   image="$BUILT_IMAGE"
   old_image=$(env_value "$ANALYZER_IMAGE_ENV" ANALYZER_IMAGE)

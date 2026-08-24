@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | ZenVis 前后端与基础设施 | `zenvis` | Web `11000`、API `11001`、Vectum `11002` |
 | Lubinsun Agent 前后端与执行器 | `lubinsun-test`（沿用历史名称） | API `192.168.100.20:18000`、Web `192.168.100.20:17000` |
-| ZenVis Analyzer | `deploy` | HTTP `18080` |
+| ZenVis Analyzer | `deploy` | 宿主机回环 `127.0.0.1:18080`；浏览器入口 `/analyzer/` |
 
 禁止用新的 project 名或另一组端口并行启动“新版”；发布只允许在上述实例中原地重建目标容器。环境文件与数据卷保持服务器本地，不进入 Git。
 
@@ -41,7 +41,18 @@ Backend main 当前有 9 个不能在生产主机直接运行的测试类：5 �
 
 ## Analyzer 迭代
 
-Analyzer 沿用现有 `deploy` project、容器名和 `18080` 端口，只原地替换一个带 main SHA 标签的镜像。`deploy/topology.env` 含连接配置，始终保留在服务器且权限为 `600`；`analyzer-zones.json` 只含区域映射，以只读方式挂载给非 root `topology` 用户，因此持久权限为 `644`。公开地址和服务注册统一使用 `192.168.100.20:18080`。发布时先备份区域配置和旧镜像，失败或手工回滚时一起恢复；健康门禁检查镜像 ID、`/healthz`、`/readyz` 和 10 秒稳定窗口内的重启次数。
+Analyzer 沿用现有 `deploy` project、容器名和容器端口 `18080`，只原地替换一个带 main SHA 标签的镜像。宿主机发布端口强制绑定 `127.0.0.1:18080`，不得绑定 `0.0.0.0`、局域网地址或直接加入公网反代；部署前的 Compose 安全不变量检查会拒绝这类配置。浏览器统一使用 ZenVis 同源入口 `/analyzer/`，由 ZenVis 前端 Nginx 先向 Backend `GET /api/v1/system/login/session/check` 发起只转发 Cookie、无请求体的鉴权子请求，再通过 Docker 内网转发给 Analyzer，API 和 WebSocket 也必须使用此前缀。鉴权接口只接受 Cookie 中的有效 `JSESSIONID`：成功返回 `204`，缺失或过期返回 `401`，Bearer Token 不能替代浏览器会话。
+
+`deploy/topology.env` 含连接配置，始终保留在服务器且权限为 `600`；`analyzer-zones.json` 只含区域映射，以只读方式挂载给非 root `topology` 用户，因此持久权限为 `644`。服务注册与服务器侧健康检查可以继续使用本机可达地址，但它们不是浏览器公开入口。Nginx 向上游保留 `/analyzer/` 前缀，由 Analyzer 路由统一识别并在内部剥离；这样页面生成的静态资源、API 和 WebSocket 路径保持一致。发布时先备份区域配置和旧镜像，失败或手工回滚时一起恢复；健康门禁从宿主机回环检查镜像 ID、`/healthz`、`/readyz` 和 10 秒稳定窗口内的重启次数。
+
+### Analyzer 鉴权入口验收
+
+发布 ZenVis Backend、Analyzer 和 Frontend 后依次确认：
+
+1. `docker compose config` 中 Analyzer 的唯一发布规则是 `127.0.0.1:18080:18080`，宿主机局域网地址不能直接访问该端口。
+2. 未携带有效 ZenVis 会话访问 `/analyzer/`、`/analyzer/api/v1/topology/snapshot` 或发起 `/analyzer/ws/topology` 握手时返回 `401`。
+3. 已登录用户通过 `https://<ZenVis域名>/analyzer/` 加载页面，静态资源、快照 API 和 WebSocket 均保持同源，浏览器中不再出现 `192.168.*:18080` 请求。
+4. Analyzer 独立替换或暂时不可用时，ZenVis 主站仍能启动；Analyzer 恢复后 Nginx 通过 Docker DNS 自动解析新容器地址。
 
 当前 main 有两个测试硬编码依赖未入库的相邻私有仓库 fixture。工作流明确只排除这两个测试名，自动执行所有其他现有及未来测试并给出 warning；维护者把 fixture 移入本仓库 `testdata` 后，应立即删除排除逻辑并恢复 `go test ./...` 全量门禁。
 
@@ -69,6 +80,8 @@ install -m 0755 deploy/automation/lubinsun-deploy-ssh-entry /home/lubinsun/.loca
 ```
 
 可回滚组件包括 `zenvis`、`zenvis-backend`、`zenvis-frontend`、`zenvis-analyzer`、`plugin-lubinsun`、`plugin-onesoc` 和 `lubinsun-agent`。会覆盖 ZenVis 数据的整套备份只允许回滚“全系统最后一次成功变更”，旧备份会被拒绝，避免覆盖后来发布的其他组件。数据库备份不在普通 Agent 镜像回滚时自动覆盖，避免抹掉发布后产生的新任务；需要数据恢复时必须进入维护窗口并人工确认。
+
+Analyzer 镜像回滚仍保持 `127.0.0.1:18080` 的安全绑定；回滚不会重新开放旧的局域网或公网端口。若鉴权链路发布失败，应按 `zenvis`（恢复挂载的 Nginx 配置）→ `zenvis-analyzer` → `zenvis-backend` 的逆序回滚相关组件，并在外层反代继续禁止直通 `18080`。
 
 ## GitHub Secrets
 
