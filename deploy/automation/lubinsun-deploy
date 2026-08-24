@@ -23,6 +23,8 @@ MIN_SWAP_KIB=${LUBINSUN_MIN_SWAP_KIB:-2097152}
 MIN_DISK_KIB=${LUBINSUN_MIN_DISK_KIB:-20971520}
 HEALTH_ATTEMPTS=${LUBINSUN_HEALTH_ATTEMPTS:-90}
 MAVEN_BUILDER_IMAGE=${LUBINSUN_MAVEN_BUILDER_IMAGE:-maven:3.9.11-eclipse-temurin-17}
+HOST_MAVEN_BIN=${LUBINSUN_HOST_MAVEN_BIN:-/home/lubinsun/.local/lib/apache-maven-3.9.11/bin/mvn}
+HOST_JAVA_HOME=${LUBINSUN_HOST_JAVA_HOME:-/home/lubinsun/.local/jvm/temurin-17}
 NODE_BUILDER_IMAGE=${LUBINSUN_NODE_BUILDER_IMAGE:-node:22-bookworm}
 
 log() {
@@ -131,6 +133,14 @@ doctor() {
   for command in git docker curl jq flock tar gzip sha256sum awk sed df stat sort head find id install mktemp; do need "$command"; done
   docker info >/dev/null
   docker compose version >/dev/null
+  if [[ -e "$(dirname "$HOST_MAVEN_BIN")" || -e "$HOST_JAVA_HOME" ]]; then
+    [[ -x "$HOST_MAVEN_BIN" && -x "$HOST_JAVA_HOME/bin/java" ]] || die "本地主机构建工具链不完整"
+    JAVA_HOME="$HOST_JAVA_HOME" PATH="$HOST_JAVA_HOME/bin:$PATH" \
+      "$HOST_MAVEN_BIN" --version | head -n 1 | grep -Fq 'Apache Maven 3.9.11 ' \
+      || die "本地主机 Maven 版本必须是 3.9.11"
+    "$HOST_JAVA_HOME/bin/java" -version 2>&1 | head -n 1 | grep -Eq '^openjdk version "17\.' \
+      || die "本地主机 Java 主版本必须是 17"
+  fi
   arch=$(uname -m)
   [[ "$arch" == x86_64 || "$arch" == amd64 ]] || die "只支持 x86_64/amd64，当前为 $arch"
   memory_kib=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
@@ -564,8 +574,19 @@ assert_latest_zenvis_release() {
 run_maven_builder() {
   local workdir=$1
   shift
-  local cache="$STATE_ROOT/cache/maven"
-  mkdir -p "$cache"
+  local cache="$STATE_ROOT/cache/maven" build_home="$STATE_ROOT/cache/maven-home"
+  mkdir -p "$cache" "$build_home"
+  if [[ -x "$HOST_MAVEN_BIN" && -x "$HOST_JAVA_HOME/bin/java" ]]; then
+    (
+      cd "$COMPONENT_REPO/$workdir"
+      HOME="$build_home" \
+      JAVA_HOME="$HOST_JAVA_HOME" \
+      PATH="$HOST_JAVA_HOME/bin:$PATH" \
+      MAVEN_OPTS="-Dmaven.repo.local=$cache/repository ${MAVEN_OPTS:-}" \
+        "$HOST_MAVEN_BIN" --batch-mode --no-transfer-progress "$@"
+    )
+    return
+  fi
   docker run --rm \
     --user "$(id -u):$(id -g)" \
     -e HOME=/tmp/maven-home \
@@ -652,8 +673,19 @@ build_zenvis_analyzer() {
 }
 
 build_plugin() {
-  local cache="$STATE_ROOT/cache/maven"
-  mkdir -p "$cache"
+  local cache="$STATE_ROOT/cache/maven" build_home="$STATE_ROOT/cache/maven-home"
+  mkdir -p "$cache" "$build_home"
+  if [[ -x "$HOST_MAVEN_BIN" && -x "$HOST_JAVA_HOME/bin/java" ]]; then
+    (
+      cd "$COMPONENT_REPO"
+      HOME="$build_home" \
+      JAVA_HOME="$HOST_JAVA_HOME" \
+      PATH="$(dirname "$HOST_MAVEN_BIN"):$HOST_JAVA_HOME/bin:$PATH" \
+      MAVEN_OPTS="-Dmaven.repo.local=$cache/repository ${MAVEN_OPTS:-}" \
+        bash ./build.sh
+    )
+    return
+  fi
   docker run --rm \
     --user "$(id -u):$(id -g)" \
     -e HOME=/tmp/maven-home \

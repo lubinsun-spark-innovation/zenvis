@@ -47,6 +47,8 @@ install -m 0755 deploy/automation/lubinsun-deploy-ssh-entry /home/lubinsun/.loca
 /home/lubinsun/.local/bin/lubinsun-deploy doctor
 ```
 
+本机优先使用 `/home/lubinsun/.local/jvm/temurin-17` 与 `/home/lubinsun/.local/lib/apache-maven-3.9.11`；两者必须同时存在且通过 `doctor` 的精确版本检查。未安装时回退到固定 Maven/Temurin Docker 镜像。当前主机工具链来自 Adoptium 与 Apache 官方发行包，并在安装前按官方元数据校验 SHA-256/SHA-512。
+
 运行状态位于 `/home/lubinsun/.local/state/lubinsun-deploy`，权限为当前部署用户私有。不要提交这里的备份、清单或环境文件。
 
 ## 手工回滚
