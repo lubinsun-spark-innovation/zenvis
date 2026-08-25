@@ -5,6 +5,9 @@ services:
 
   zenvis-backend:
     image: ${ZENVIS_BACKEND_IMAGE:?ZENVIS_BACKEND_IMAGE is required}
+    environment:
+      LUBINSUN_BASE_URL: ${LUBINSUN_BASE_URL:?LUBINSUN_BASE_URL is required}
+      LUBINSUN_INTEGRATION_TOKEN: ${LUBINSUN_INTEGRATION_TOKEN:?LUBINSUN_INTEGRATION_TOKEN is required}
 
   zenvis-frontend:
     image: ${ZENVIS_FRONTEND_IMAGE:?ZENVIS_FRONTEND_IMAGE is required}

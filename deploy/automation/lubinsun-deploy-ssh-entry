@@ -3,6 +3,28 @@ set -Eeuo pipefail
 umask 077
 
 DEPLOY_BIN=/home/lubinsun/.local/bin/lubinsun-deploy
+JOB_ROOT=/home/lubinsun/.local/state/lubinsun-deploy/jobs
+
+if [[ ${1:-} == --run-job ]]; then
+  [[ $# -eq 6 ]] || exit 64
+  component=$2
+  repository=$3
+  sha=$4
+  log_file=$5
+  status_file=$6
+  [[ "$component" =~ ^[a-z0-9-]+$ && "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ \
+    && "$sha" =~ ^[0-9a-f]{40}$ ]] || exit 64
+  [[ "$log_file" == "$JOB_ROOT"/* && "$status_file" == "$JOB_ROOT"/* ]] || exit 64
+  set +e
+  "$DEPLOY_BIN" deploy "$component" "$repository" "$sha" >"$log_file" 2>&1
+  code=$?
+  temp_status="${status_file}.tmp"
+  printf '%s\n' "$code" >"$temp_status"
+  chmod 600 "$log_file" "$temp_status"
+  mv "$temp_status" "$status_file"
+  exit "$code"
+fi
+
 original=${SSH_ORIGINAL_COMMAND:-}
 
 if [[ -z "$original" || "$original" == *$'\n'* || "$original" == *$'\r'* ]]; then
@@ -20,11 +42,13 @@ component=${argv[2]}
 repository=${argv[3]}
 sha=${argv[4]}
 case "$component" in
+  zenvis) expected_repository=lubinsun-spark-innovation/zenvis ;;
   zenvis-backend) expected_repository=lubinsun-spark-innovation/zenvis-backend ;;
   zenvis-frontend) expected_repository=lubinsun-spark-innovation/zenvis-frontend ;;
   zenvis-analyzer) expected_repository=lubinsun-spark-innovation/zenvis-service-analyzer ;;
+  lubinsun-agent) expected_repository=lubinsun-spark-innovation/lubinsun_agent ;;
   *)
-    printf '拒绝：该密钥只允许 ZenVis frontend、backend 和 analyzer 自动部署\n' >&2
+    printf '拒绝：该密钥只允许已登记的应用与部署编排自动部署\n' >&2
     exit 64
     ;;
 esac
@@ -32,4 +56,22 @@ esac
 [[ "$repository" == "$expected_repository" ]] || { printf '拒绝：仓库与组件不匹配\n' >&2; exit 64; }
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { printf '拒绝：Git SHA 非法\n' >&2; exit 64; }
 
-exec "$DEPLOY_BIN" deploy "$component" "$repository" "$sha"
+install -d -m 0700 "$JOB_ROOT"
+job="${component}-${sha:0:12}-$(date -u '+%Y%m%d%H%M%S')-$$"
+log_file="$JOB_ROOT/$job.log"
+status_file="$JOB_ROOT/$job.status"
+nohup setsid "$0" --run-job "$component" "$repository" "$sha" "$log_file" "$status_file" \
+  </dev/null >/dev/null 2>&1 &
+
+for ((attempt=1; attempt<=7200; attempt++)); do
+  if [[ -f "$status_file" ]]; then
+    code=$(<"$status_file")
+    [[ "$code" =~ ^[0-9]+$ ]] || { printf '部署任务状态损坏：%s\n' "$job" >&2; exit 1; }
+    [[ -f "$log_file" ]] && cat "$log_file"
+    exit "$code"
+  fi
+  sleep 1
+done
+
+printf '服务器部署任务仍在后台运行：%s\n' "$job" >&2
+exit 124

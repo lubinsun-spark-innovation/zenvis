@@ -1,6 +1,6 @@
 # Lubinsun 自动部署与发布控制器
 
-`lubinsun-deploy` 是部署主机上的统一控制器。只有 `zenvis-frontend`、`zenvis-backend` 和 `zenvis-service-analyzer` 的 main Actions 可以通过专用 SSH key 调用生产部署；ZenVis 总仓库与 Lubinsun Agent 只做验证，插件工作流只测试和打包。生产 Token、数据库密码和 Provider 密钥始终只保存在服务器环境文件中。
+`lubinsun-deploy` 是部署主机上的唯一生产部署控制器。ZenVis 编排、ZenVis Frontend、ZenVis Backend、Analyzer 和 Lubinsun Agent 的 main Actions，以及服务器上的本地手工部署，都调用同一套版本判断、构建、备份、Compose、健康检查和回滚逻辑。插件工作流仍只测试和打包，不自动安装。生产 Token、数据库密码和 Provider 密钥始终只保存在服务器环境文件中。
 
 ## 单实例不变量
 
@@ -14,17 +14,47 @@
 
 禁止用新的 project 名或另一组端口并行启动“新版”；发布只允许在上述实例中原地重建目标容器。环境文件与数据卷保持服务器本地，不进入 Git。
 
-Agent 受控手工部署固定组合 main 的 `docker-compose.yml` 与 `agent-compose.automation.yml`，不使用会切换为 host network 和另一套固定容器名的 `docker-compose.server.yml`。首次接管时从正在运行的 `lubinsun-test-backend-1` 与 `lubinsun-test-frontend-1` 读取真实绑定地址和端口，写入权限为 `600` 的服务器运行状态；后续手工部署复用该状态、`lubinsun-test_agent-data`、skills 挂载与现有 MySQL 数据目录。Agent Actions 不调用生产部署。
+Agent 固定组合发布源码快照内的 `docker-compose.yml` 与版本化的 `deploy/docker-compose.production.yml`，不使用会切换为 host network 和另一套固定容器名的 `docker-compose.server.yml`。首次接管时从正在运行的容器发现真实绑定地址、端口和 MySQL bind mount，写入权限为 `600` 的服务器运行状态；后续部署复用该状态、`lubinsun-test_agent-data` 与现有 MySQL 数据目录。系统 Skill 使用镜像内与源码摘要一致的副本，不再直接挂载开发工作树，避免本地编辑绕过发布立即影响运行环境。
 
+## 统一版本与幂等规则
 
-## 三组件自动部署固定流程
+- 每个组件按真实部署输入计算 SHA-256 内容摘要。README、AGENTS 或 Workflow 等不进入应用镜像的文件不会制造无意义重建。
+- 本地手工部署会用临时 Git index 捕获当前工作树，允许包含尚未提交的修改，但不会修改用户现有 index；随后从隔离快照构建。
+- Action 从 `origin/main` 的提交树创建隔离快照，绝不切换或覆盖服务器上的开发工作树。
+- 镜像使用 `src-<digest>` 不可变标签，并写入 `org.opencontainers.image.revision`、`org.opencontainers.image.source-digest` 与源码仓库标签。
+- reconcile 直接检查运行容器的 image ID、镜像内容摘要，并将 `docker compose config --hash` 与每个容器的实际 `com.docker.compose.config-hash` 对照，再检查端口/挂载不变量和健康状态。完全一致时记录 `no-op` 并跳过构建、备份和容器重建。
+- 因此，本地修改先部署、之后原样 commit/push 时，Action 仍会完成 CI 验证，但服务器识别到相同内容摘要后不会再次部署。
+- 五个仓库的每次 main push 都会创建 reconcile 工作流，避免路径过滤与服务器摘要规则不一致造成漏部署；文档等非部署输入提交会在服务器快速 `no-op`。
+- 旧 Action 事件若只被文档等不影响部署的 main 提交取代，会按当前 main 的等价部署内容继续校验；若部署内容已经变化，则让较新的工作流接管。
+- 不得在包含部署输入变更的提交中使用 `[skip ci]`；它会让 GitHub 不创建工作流，服务器也就没有 reconcile 事件。仅文档/工作流元数据提交可以按团队规则使用。
 
-1. 取得跨仓库 `flock`，防止 frontend、backend 和 analyzer 工作流同时修改 Compose 状态。
+## 自动与手工部署固定流程
+
+1. 取得跨仓库 `flock`，防止五个仓库的工作流或本地部署同时修改 Compose 状态。
 2. 检查 CPU 架构、内存、Swap、磁盘、NTP、Docker/Compose、环境文件权限和模板占位值。
-3. 校验 GitHub 仓库白名单、40 位 SHA 与 `origin/main`，旧事件被更新 main 取代时安全跳过。
-4. 用固定版本的 Maven、Node 或 Go 工具链从当前 main SHA 重新生成产物；镜像写入并复核 `org.opencontainers.image.revision`。
-5. Backend 数据变更前创建一致性备份；Analyzer 发布前备份生产环境、区域配置和旧镜像；应用失败时自动恢复旧镜像或一致性备份。
-6. 验证目标容器状态、原端口 HTTP 入口和业务 smoke，再写入 current/previous 发布台账。
+3. 获取本地工作树或 GitHub main 的隔离源码快照，计算部署输入摘要。
+4. 对比服务器实际容器镜像 ID、内容摘要、逐服务 Compose config hash、端口/挂载/密钥注入和健康状态；一致则 `no-op`。
+5. 用固定版本的 Maven、Node 或 Go 工具链生成产物；镜像元数据必须与目标 revision 和内容摘要同时一致。
+6. ZenVis 数据变更前创建一致性备份；Agent Backend 或运行编排变更前短暂停止应用写入，成对备份 MySQL 与 `agent-data` workspace；Analyzer 备份区域配置、环境与旧镜像。
+7. 只在固定 Compose project 中原地替换受影响服务，不创建第二套端口、容器或数据卷。
+8. 验证目标容器 image ID、内容摘要、原端口、API readiness、Web、执行器和业务 smoke，再原子写入 current/previous/last-verification 台账；失败自动切回旧镜像与旧源码快照。
+
+Agent 的 Backend、Frontend 与 managed stack 分别计算摘要。每次发布还会记录 migration 文件逐项 SHA-256；历史 migration 被删除或改写时会在启动新 Backend 前拒绝部署。回滚优先做兼容的镜像/配置切换；若数据库含目标旧版本没有的 migration，控制器会先建立 rollback-safety 备份，再成对恢复该发布前的 MySQL 与 workspace，避免旧应用直接读取不兼容结构。
+
+## 本地开发后的正式手工部署
+
+本地开发、提交前验收和 GitHub Actions 共用同一个入口。以下命令部署当前工作树，而不是强制拉取 GitHub：
+
+```bash
+/home/lubinsun/.local/bin/lubinsun-deploy deploy-local zenvis
+/home/lubinsun/.local/bin/lubinsun-deploy deploy-local zenvis-backend
+/home/lubinsun/.local/bin/lubinsun-deploy deploy-local zenvis-frontend
+/home/lubinsun/.local/bin/lubinsun-deploy deploy-local zenvis-analyzer
+/home/lubinsun/.local/bin/lubinsun-deploy deploy-local lubinsun-agent
+/home/lubinsun/.local/bin/lubinsun-deploy verify all
+```
+
+只运行受影响的组件。`lubinsun-agent` 会分别计算 Backend（含执行器、迁移和系统 Skill）、Frontend 与 managed stack 摘要，并按实际服务 config hash 只重建发生变化的容器；纯 Frontend 变化不会触碰 Backend、执行器或数据库。执行完先用 `status` 核对，再 commit/push。若 push 内容与本地已部署内容相同，Action 的服务器阶段输出 `no-op`。
 
 ## Backend 测试隔离
 
@@ -72,6 +102,8 @@ install -m 0755 deploy/automation/lubinsun-deploy-ssh-entry /home/lubinsun/.loca
 
 运行状态位于 `/home/lubinsun/.local/state/lubinsun-deploy`，权限为当前部署用户私有。不要提交这里的备份、清单或环境文件。
 
+源码快照、一致性备份和 SSH 部署任务日志不会在发布过程中按时间盲删。磁盘需要整理时显式执行 `lubinsun-deploy gc 3`；它会保留每类至少 3 个未引用恢复点和每组件至少 3 个已完成任务，永远跳过 current/previous/活动源码指针引用的目录、校验失败的备份、结构异常的快照以及尚无最终状态的任务。
+
 ## 手工回滚
 
 ```bash
@@ -79,13 +111,13 @@ install -m 0755 deploy/automation/lubinsun-deploy-ssh-entry /home/lubinsun/.loca
 /home/lubinsun/.local/bin/lubinsun-deploy rollback zenvis-frontend
 ```
 
-可回滚组件包括 `zenvis`、`zenvis-backend`、`zenvis-frontend`、`zenvis-analyzer`、`plugin-lubinsun`、`plugin-onesoc` 和 `lubinsun-agent`。会覆盖 ZenVis 数据的整套备份只允许回滚“全系统最后一次成功变更”，旧备份会被拒绝，避免覆盖后来发布的其他组件。数据库备份不在普通 Agent 镜像回滚时自动覆盖，避免抹掉发布后产生的新任务；需要数据恢复时必须进入维护窗口并人工确认。
+可回滚组件包括 `zenvis`、`zenvis-backend`、`zenvis-frontend`、`zenvis-analyzer` 和 `lubinsun-agent`。插件由 ZenVis 页面手动上传与管理，不由控制器自动安装或回滚。会覆盖 ZenVis 数据的整套备份只允许回滚“全系统最后一次成功变更”，旧备份会被拒绝，避免覆盖后来发布的其他组件。Agent 只有在数据库 migration 无法向目标版本兼容时才恢复配对数据；该操作会明确创建 rollback-safety 恢复点。
 
 Analyzer 镜像回滚仍保持 `127.0.0.1:18080` 的安全绑定；回滚不会重新开放旧的局域网或公网端口。若鉴权链路发布失败，应按 `zenvis`（恢复挂载的 Nginx 配置）→ `zenvis-analyzer` → `zenvis-backend` 的逆序回滚相关组件，并在外层反代继续禁止直通 `18080`。
 
 ## GitHub Secrets
 
-仅以下三个仓库的 `production` Environment 需要部署 Secrets：`zenvis-frontend`、`zenvis-backend`、`zenvis-service-analyzer`。
+以下五个仓库的 `production` Environment 使用同一组部署 Secrets：`zenvis`、`zenvis-frontend`、`zenvis-backend`、`zenvis-service-analyzer`、`lubinsun_agent`。
 
 - `DEPLOY_HOST`
 - `DEPLOY_PORT`
@@ -93,4 +125,4 @@ Analyzer 镜像回滚仍保持 `127.0.0.1:18080` 的安全绑定；回滚不会�
 - `DEPLOY_SSH_PRIVATE_KEY`
 - `DEPLOY_SSH_KNOWN_HOSTS`
 
-必须固定 `known_hosts`，禁止在工作流中以 `ssh-keyscan` 动态信任未知主机。SSH 密码不用于自动部署；专用公钥在 `authorized_keys` 中以 `restrict,command="/home/lubinsun/.local/bin/lubinsun-deploy-ssh-entry"` 限制，只允许 frontend、backend 和 analyzer 三个仓库调用对应部署命令。
+必须固定 `known_hosts`，禁止在工作流中以 `ssh-keyscan` 动态信任未知主机。SSH 密码不用于自动部署；专用公钥在 `authorized_keys` 中以 `restrict,command="/home/lubinsun/.local/bin/lubinsun-deploy-ssh-entry"` 限制，只允许上述五个仓库调用各自白名单中的部署命令。受限入口用 `nohup + setsid` 启动私有后台任务，并把日志与最终退出码写入状态目录；正常连接会等待并回传结果，Actions 的 SSH 客户端临时断线也不会停在“服务已停止但备份未完成”的中间状态。
