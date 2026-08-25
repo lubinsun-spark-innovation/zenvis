@@ -1,6 +1,6 @@
 # Lubinsun 自动部署与发布控制器
 
-`lubinsun-deploy` 是部署主机上的唯一生产部署控制器。ZenVis 编排、ZenVis Frontend、ZenVis Backend、Analyzer 和 Lubinsun Agent 的 main Actions，以及服务器上的本地手工部署，都调用同一套版本判断、构建、备份、Compose、健康检查和回滚逻辑。插件工作流仍只测试和打包，不自动安装。生产 Token、数据库密码和 Provider 密钥始终只保存在服务器环境文件中。
+`lubinsun-deploy` 是部署主机上的唯一生产部署控制器。ZenVis 编排、ZenVis Frontend、ZenVis Backend、Analyzer 和 Lubinsun Agent 的 main Actions，以及服务器上的本地手工部署，都调用同一套版本判断、构建、备份、Compose、健康检查和回滚逻辑。插件工作流负责测试、可重复打包和发布不可变 GitHub Release，但不自动安装。生产 Token、数据库密码和 Provider 密钥始终只保存在服务器环境文件中。
 
 ## 单实例不变量
 
@@ -64,10 +64,11 @@ Backend main 当前有 9 个不能在生产主机直接运行的测试类：5 �
 
 ## 插件迭代
 
-- main push 只做 JSON/YAML 校验、Java 测试、版本严格递增校验和打包，生成包含 `tar.gz` 与 SHA-256 的 Actions Artifact。
+- main push 做 JSON/YAML 校验、Java 测试、版本严格递增校验和可重复打包，同时生成 Actions Artifact，并将 `tar.gz` 与 SHA-256 发布到对应的不可变 GitHub Release。
 - 插件工作流没有 production environment、SSH 凭据、服务器命令或安装 API 调用，不能改变当前运行插件。
-- 正式安装入口只有 ZenVis 插件页面：下载并校验 Artifact 后手动上传。
+- 正式安装入口只有 ZenVis 插件页面：从 GitHub Release 下载 `tar.gz` 与 `.sha256`，校验通过后手动上传。
 - 插件描述 `index.json` 与动态 API `pom.xml` 必须保持同一 SemVer；只有插件内容或构建入口变化时，main 版本才必须严格递增。
+- Release tag 固定指向生成包的源码提交；重复执行同一版本只会校验 tag、源码提交和包摘要并安全跳过，不覆盖已有资产。
 
 ## Analyzer 迭代
 

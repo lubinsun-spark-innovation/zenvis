@@ -208,7 +208,8 @@ component_tree_digest() {
   case "$component:$variant" in
     zenvis:*)
       paths=(deploy/docker-compose.yml deploy/docker-compose.automation.yml deploy/config
-        deploy/automation zenvisctl quick-deploy.sh)
+        deploy/automation/lubinsun-deploy deploy/automation/lubinsun-deploy-ssh-entry
+        zenvisctl quick-deploy.sh)
       ;;
     zenvis-backend:*)
       paths=(Dockerfile build.sh pom.xml src)
